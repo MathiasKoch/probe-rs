@@ -761,7 +761,9 @@ impl<'probe> ActiveFlasher<'probe, Erase> {
                         r3: None,
                     },
                     false,
-                    Duration::from_secs(30),
+                    Duration::from_millis(
+                        200_000 as u64,
+                    ),
                 )
                 .map_err(|error| FlashError::ChipEraseFailed {
                     source: Box::new(error),
