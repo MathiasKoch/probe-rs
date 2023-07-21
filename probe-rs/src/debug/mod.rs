@@ -14,7 +14,7 @@ pub mod debug_info;
 pub mod debug_step;
 /// References to the DIE (debug information entry) of functions.
 pub mod function_die;
-/// Target Register definitions.
+/// Target Register definitions, expanded from [`crate::core::registers::CoreRegister`] to include unwind specific information.
 pub mod registers;
 /// The source statement information used while identifying haltpoints for debug stepping and breakpoints.
 pub(crate) mod source_statement;
@@ -33,7 +33,6 @@ pub use self::{
 };
 use crate::{core::Core, MemoryInterface};
 use gimli::DebuggingInformationEntry;
-
 use std::{
     io,
     path::PathBuf,

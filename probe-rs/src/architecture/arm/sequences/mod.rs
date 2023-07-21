@@ -466,11 +466,25 @@ pub trait ArmDebugSequence: Send + Sync {
             Some(crate::WireProtocol::Jtag) => {
                 // Execute SWJ-DP Switch Sequence SWD to JTAG (0xE73C).
                 interface.swj_sequence(16, 0xE73C)?;
+
+                // Execute at least >5 TCK cycles with TMS high to enter the Test-Logic-Reset state
+                interface.swj_sequence(6, 0x3F)?;
+
+                // Enter Run-Test-Idle state, as required by the DAP_Transfer command when using JTAG
+                interface.jtag_sequence(1, false, 0x01)?;
+
+                // Configure JTAG IR lengths in probe
+                interface.configure_jtag()?;
             }
             Some(crate::WireProtocol::Swd) => {
                 // Execute SWJ-DP Switch Sequence JTAG to SWD (0xE79E).
                 // Change if SWJ-DP uses deprecated switch code (0xEDB6).
                 interface.swj_sequence(16, 0xE79E)?;
+
+                // > 50 cycles SWDIO/TMS High.
+                interface.swj_sequence(51, 0x0007_FFFF_FFFF_FFFF)?;
+                // At least 2 idle cycles (SWDIO/TMS Low).
+                interface.swj_sequence(3, 0x00)?;
             }
             _ => {
                 return Err(ArmDebugSequenceError::SequenceSpecific(
@@ -479,9 +493,6 @@ pub trait ArmDebugSequence: Send + Sync {
                 .into());
             }
         }
-
-        interface.swj_sequence(51, 0x0007_FFFF_FFFF_FFFF)?; // > 50 cycles SWDIO/TMS High.
-        interface.swj_sequence(3, 0x00)?; // At least 2 idle cycles (SWDIO/TMS Low).
 
         // End of atomic block.
 
@@ -723,22 +734,19 @@ pub trait ArmDebugSequence: Send + Sync {
     #[doc(alias = "DebugCoreStop")]
     fn debug_core_stop(
         &self,
-        interface: &mut dyn ArmProbeInterface,
-        core_ap: MemoryAp,
+        interface: &mut dyn ArmProbe,
         core_type: CoreType,
     ) -> Result<(), ArmError> {
         if core_type.is_cortex_m() {
-            let mut memory_interface = interface.memory_interface(core_ap)?;
-
             // System Control Space (SCS) offset as defined in Armv6-M/Armv7-M.
             // Disable Core Debug via DHCSR
             let mut dhcsr = Dhcsr(0);
             dhcsr.enable_write();
-            memory_interface.write_word_32(Dhcsr::get_mmio_address(), dhcsr.0)?;
+            interface.write_word_32(Dhcsr::get_mmio_address(), dhcsr.0)?;
 
             // Disable DWT and ITM blocks, DebugMonitor handler,
             // halting debug traps, and Reset Vector Catch.
-            memory_interface.write_word_32(Demcr::get_mmio_address(), 0x0)?;
+            interface.write_word_32(Demcr::get_mmio_address(), 0x0)?;
         }
 
         Ok(())

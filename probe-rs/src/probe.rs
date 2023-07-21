@@ -1,3 +1,5 @@
+pub(crate) mod common;
+
 pub(crate) mod cmsisdap;
 pub(crate) mod espusbjtag;
 pub(crate) mod fake_probe;
@@ -156,8 +158,8 @@ pub enum DebugProbeError {
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 
-    /// A timeout occured during probe operation.
-    #[error("Timeout occured during probe operation.")]
+    /// A timeout occurred during probe operation.
+    #[error("Timeout occurred during probe operation.")]
     Timeout,
 }
 
@@ -351,7 +353,7 @@ impl Probe {
         Session::new(self, target.into(), AttachMethod::UnderReset, permissions).map_err(|e| {
             if matches!(e, Error::Arm(ArmError::Timeout) | Error::Riscv(RiscvError::Timeout)) {
                 Error::Other(
-                anyhow::anyhow!("Timeout while attaching to target under reset. This can happen if the target is not responding to the reset sequence. Ensure the chip's reset pin is connected, or try attaching without reset."))
+                anyhow::anyhow!("Timeout while attaching to target under reset. This can happen if the target is not responding to the reset sequence. Ensure the chip's reset pin is connected, or try attaching without reset (`connectUnderReset = false` for DAP Clients, or remove `connect-under-reset` option from CLI options.)."))
             } else {
                 e
             }
@@ -842,6 +844,7 @@ pub trait JTAGAccess: DebugProbe {
         &mut self,
         writes: &[JtagWriteCommand],
     ) -> Result<Vec<CommandResult>, BatchExecutionError> {
+        tracing::debug!("Using default `JTAGAccess::write_register_batch` this will hurt performance. Please implement proper batching for this probe.");
         let mut results = Vec::new();
 
         for write in writes {
