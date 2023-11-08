@@ -23,6 +23,8 @@ pub struct FlashProperties {
     pub program_page_timeout: u32,
     /// The approximative time it takes to erase a sector.
     pub erase_sector_timeout: u32,
+    /// The approximative time it takes to erase the full chip.
+    pub erase_chip_timeout: u32,
     /// The available sectors of the device flash.
     #[serde(default)]
     pub sectors: Vec<SectorDescription>,
@@ -37,6 +39,7 @@ impl Default for FlashProperties {
             erased_byte_value: 0,
             program_page_timeout: 0,
             erase_sector_timeout: 0,
+            erase_chip_timeout: 30_000,
             sectors: vec![],
         }
     }
