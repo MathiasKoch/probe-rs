@@ -26,7 +26,7 @@ bitfield! {
     pub struct ExcReturn(u32);
     /// If the value is 0xF, then this is a valid EXC_RETURN value.
     pub is_exception_flag, _: 31, 28;
-    /// Defines whether the stack frame for this exception has space allocated for FPU state information. Bit [4] is 0 if stack space is the exended frame that includes FPU registes.
+    /// Defines whether the stack frame for this exception has space allocated for FPU state information. Bit [4] is 0 if stack space is the extended frame that includes FPU registers.
     pub use_standard_stackframe, _: 4;
     /// Identifies one of the following 3 behaviours.
     /// - 0x1: Return to Handler mode(always uses the Main SP).
@@ -50,7 +50,7 @@ bitfield! {
 
 /// Decode the exception information.
 pub(crate) fn exception_details(
-    memory: &dyn ExceptionInterface,
+    exception_interface: &dyn ExceptionInterface,
     memory_interface: &mut dyn MemoryInterface,
     stackframe_registers: &DebugRegisters,
 ) -> Result<Option<ExceptionInfo>, Error> {
@@ -71,8 +71,9 @@ pub(crate) fn exception_details(
         // This is an exception frame.
 
         Ok(Some(ExceptionInfo {
-            description: memory.exception_description(memory_interface, stackframe_registers)?,
-            calling_frame_registers: memory
+            description: exception_interface
+                .exception_description(memory_interface, stackframe_registers)?,
+            calling_frame_registers: exception_interface
                 .calling_frame_registers(memory_interface, stackframe_registers)?,
         }))
     } else {

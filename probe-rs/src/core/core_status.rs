@@ -5,7 +5,7 @@ pub enum CoreStatus {
     Running,
     /// The core is currently halted. This also specifies the reason as a payload.
     Halted(HaltReason),
-    /// This is a Cortex-M specific status, and will not be set or handled by RISCV code.
+    /// This is a Cortex-M specific status, and will not be set or handled by RISC-V code.
     LockedUp,
     /// The core is currently sleeping.
     Sleeping,
@@ -36,6 +36,11 @@ pub enum SemihostingCommand {
     ExitError {
         /// Some architecture-specific or application specific exit code
         code: u64,
+    },
+    /// The target indicated that it would like to run a semihosting operation which we don't support yet
+    Unknown {
+        /// The semihosting operation requested
+        operation: u32,
     },
 }
 

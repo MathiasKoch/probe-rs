@@ -1,7 +1,6 @@
 use crate::*;
 use anyhow::{anyhow, Result};
 use defmt_decoder::DecodeError;
-use num_traits::Zero;
 pub use probe_rs::rtt::ChannelMode;
 use probe_rs::rtt::{DownChannel, Rtt, ScanRegion, UpChannel};
 use probe_rs::Core;
@@ -18,39 +17,43 @@ use std::{
 };
 use time::{OffsetDateTime, UtcOffset};
 
+/// Try to find the RTT control block in the ELF file and attach to it.
+///
+/// This function can return `Ok(None)` to indicate that RTT is not available on the target.
 pub fn attach_to_rtt(
     core: &mut Core,
     memory_map: &[MemoryRegion],
-    scan_regions: &[std::ops::Range<u64>],
+    rtt_region: &ScanRegion,
     elf_file: &Path,
-    rtt_config: &RttConfig,
-    timestamp_offset: UtcOffset,
-    log_format: Option<&str>,
-) -> Result<RttActiveTarget, anyhow::Error> {
-    log::info!("Initializing RTT");
-    let rtt_header_address = if let Ok(mut file) = File::open(elf_file) {
-        if let Some(address) = RttActiveTarget::get_rtt_symbol(&mut file) {
-            ScanRegion::Exact(address as u32)
-        } else {
-            ScanRegion::Ranges(scan_regions.to_vec())
-        }
-    } else {
-        ScanRegion::Ranges(scan_regions.to_vec())
-    };
+) -> Result<Option<Rtt>, anyhow::Error> {
+    // Try to find the RTT control block symbol in the ELF file.
 
-    if let ScanRegion::Ranges(rngs) = &rtt_header_address {
-        if rngs.is_empty() {
-            // We have no regions to scan so we cannot initialize RTT.
-            return Err(anyhow!("ELF file has no RTT block symbol, and this target does not support automatic scanning"));
+    // If we find it, we can use the exact address to attach to the RTT control block. Otherwise, we
+    // fall back to the caller-provided scan regions.
+    let exact_rtt_region;
+    let mut rtt_region = rtt_region;
+
+    if let Ok(mut file) = File::open(elf_file) {
+        if let Some(address) = RttActiveTarget::get_rtt_symbol(&mut file) {
+            exact_rtt_region = ScanRegion::Exact(address as u32);
+            rtt_region = &exact_rtt_region;
         }
     }
 
-    match Rtt::attach_region(core, memory_map, &rtt_header_address) {
+    tracing::info!("Initializing RTT");
+
+    if let ScanRegion::Ranges(rngs) = &rtt_region {
+        if rngs.is_empty() {
+            // We have no regions to scan so we cannot initialize RTT.
+            tracing::debug!("ELF file has no RTT block symbol, and this target does not support automatic scanning");
+            return Ok(None);
+        }
+    }
+
+    match Rtt::attach_region(core, memory_map, rtt_region) {
         Ok(rtt) => {
-            log::info!("RTT initialized.");
-            let app =
-                RttActiveTarget::new(rtt, elf_file, rtt_config, timestamp_offset, log_format)?;
-            Ok(app)
+            tracing::info!("RTT initialized.");
+            Ok(Some(rtt))
         }
         Err(err) => Err(anyhow!("Error attempting to attach to RTT: {}", err)),
     }
@@ -90,7 +93,7 @@ impl FromStr for DataFormat {
 }
 
 /// The initial configuration for RTT (Real Time Transfer). This configuration is complimented with the additional information specified for each of the channels in `RttChannel`.
-#[derive(clap::Parser, Debug, Clone, Deserialize, Default)]
+#[derive(clap::Parser, Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RttConfig {
     #[structopt(skip)]
     #[serde(default, rename = "rttEnabled")]
@@ -101,8 +104,10 @@ pub struct RttConfig {
     pub channels: Vec<RttChannelConfig>,
 }
 
-/// The User specified configuration for each active RTT Channel. The configuration is passed via a DAP Client configuration (`launch.json`). If no configuration is specified, the defaults will be `Dataformat::String` and `show_timestamps=false`.
-#[derive(clap::Parser, Debug, Clone, serde::Deserialize, Default)]
+/// The User specified configuration for each active RTT Channel. The configuration is passed via a
+/// DAP Client configuration (`launch.json`). If no configuration is specified, the defaults will be
+/// `Dataformat::String` and `show_timestamps=false`.
+#[derive(clap::Parser, Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RttChannelConfig {
     pub channel_number: Option<usize>,
@@ -119,7 +124,8 @@ pub struct RttChannelConfig {
     pub show_location: bool,
 }
 
-/// This is the primary interface through which RTT channel data is read and written. Every actual RTT channel has a configuration and buffer that is used for this purpose.
+/// This is the primary interface through which RTT channel data is read and written. Every actual
+/// RTT channel has a configuration and buffer that is used for this purpose.
 #[derive(Debug)]
 pub struct RttActiveChannel {
     pub up_channel: Option<UpChannel>,
@@ -139,7 +145,10 @@ pub struct RttActiveChannel {
     timestamp_offset: UtcOffset,
 }
 
-/// A fully configured RttActiveChannel. The configuration will always try to 'default' based on information read from the RTT control block in the binary. Where insufficient information is available, it will use the supplied configuration, with final hardcoded defaults where no other information was available.
+/// A fully configured RttActiveChannel. The configuration will always try to 'default' based on
+/// information read from the RTT control block in the binary. Where insufficient information is
+/// available, it will use the supplied configuration, with final hardcoded defaults where no other
+/// information was available.
 impl RttActiveChannel {
     pub fn new(
         up_channel: Option<UpChannel>,
@@ -218,20 +227,14 @@ impl RttActiveChannel {
             // Retry loop, in case the probe is temporarily unavailable, e.g. user pressed the `reset` button.
             for _loop_count in 0..10 {
                 match channel.read(core, self.rtt_buffer.0.as_mut()) {
-                    Ok(count) => {
-                        if count.is_zero() {
-                            return None;
-                        } else {
-                            return Some(count);
-                        }
+                    Ok(0) => return None,
+                    Ok(count) => return Some(count),
+                    Err(probe_rs::rtt::Error::Probe(_)) => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     Err(err) => {
-                        if matches!(err, probe_rs::rtt::Error::Probe(_)) {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                        } else {
-                            log::error!("\nError reading from RTT: {}", err);
-                            return None;
-                        }
+                        tracing::error!("\nError reading from RTT: {}", err);
+                        return None;
                     }
                 }
             }
@@ -281,7 +284,7 @@ impl RttActiveChannel {
 
     fn get_string(&self, bytes_read: usize, formatted_data: &mut String) {
         let incoming = String::from_utf8_lossy(&self.rtt_buffer.0[..bytes_read]).to_string();
-        for (_i, line) in incoming.split_terminator('\n').enumerate() {
+        for line in incoming.split_terminator('\n') {
             if self.show_timestamps {
                 write!(
                     formatted_data,
@@ -339,8 +342,7 @@ impl RttActiveChannel {
                                     None,
                                 )
                             };
-                            let s =
-                                formatter.format_to_string(frame, file.as_deref(), line, module);
+                            let s = formatter.format_frame(frame, file.as_deref(), line, module);
                             writeln!(formatted_data, "{s}").expect("Writing to String cannot fail");
                             continue;
                         }
@@ -368,18 +370,24 @@ impl RttActiveChannel {
     }
 }
 
-/// Once an active connection with the Target RTT control block has been established, we configure each of the active channels, and hold essential state information for successfull communication.
+/// Once an active connection with the Target RTT control block has been established, we configure
+/// each of the active channels, and hold essential state information for successful communication.
 #[derive(Debug)]
 pub struct RttActiveTarget {
     pub active_channels: Vec<RttActiveChannel>,
     pub defmt_state: Option<DefmtState>,
 }
 
-#[derive(Debug)]
 pub struct DefmtState {
     table: defmt_decoder::Table,
     locs: Option<defmt_decoder::Locations>,
-    formatter: defmt_decoder::log::Formatter,
+    formatter: defmt_decoder::log::format::Formatter,
+}
+
+impl fmt::Debug for DefmtState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DefmtState").finish()
+    }
 }
 
 impl RttActiveTarget {
@@ -444,7 +452,7 @@ impl RttActiveTarget {
             })?;
 
             let show_location = active_channels
-                .get(0)
+                .first()
                 .expect("`active_channels` is not empty")
                 .show_location;
 
@@ -463,18 +471,19 @@ impl RttActiveTarget {
                     (false, true) => "{t} {L} {s}",
                     (false, false) => "{L} {s}",
                 });
-                let formatter = defmt_decoder::log::Formatter::new(format);
+                let format = defmt_decoder::log::format::FormatterConfig::custom(format);
+                let formatter = defmt_decoder::log::format::Formatter::new(format);
 
                 let locs = {
                     let locs = table.get_locations(&elf)?;
 
                     if !table.is_empty() && locs.is_empty() {
-                        log::warn!("Insufficient DWARF info; compile your program with `debug = 2` to enable location info.");
+                        tracing::warn!("Insufficient DWARF info; compile your program with `debug = 2` to enable location info.");
                         None
                     } else if table.indices().all(|idx| locs.contains_key(&(idx as u64))) {
                         Some(locs)
                     } else {
-                        log::warn!(
+                        tracing::warn!(
                             "Location info is incomplete; it will be omitted from the output."
                         );
                         None
@@ -486,7 +495,7 @@ impl RttActiveTarget {
                     formatter,
                 })
             } else {
-                log::warn!("No `Table` definition in DWARF info; compile your program with `debug = 2` to enable location info.");
+                tracing::warn!("No `Table` definition in DWARF info; compile your program with `debug = 2` to enable location info.");
                 None
             }
         } else {
@@ -513,7 +522,9 @@ impl RttActiveTarget {
             }
         }
 
-        log::warn!("No RTT header info was present in the ELF file. Does your firmware run RTT?");
+        tracing::warn!(
+            "No RTT header info was present in the ELF file. Does your firmware run RTT?"
+        );
         None
     }
 
@@ -538,15 +549,11 @@ impl RttActiveTarget {
     // }
 }
 
-struct RttBuffer(Vec<u8>);
+pub(crate) struct RttBuffer(pub Vec<u8>);
 impl RttBuffer {
     /// Initialize the buffer and ensure it has enough capacity to match the size of the RTT channel on the target at the time of instantiation. Doing this now prevents later performance impact if the buffer capacity has to be grown dynamically.
-    pub fn new(mut buffer_size: usize) -> RttBuffer {
-        let mut rtt_buffer = vec![0u8; 1];
-        while buffer_size > 0 {
-            buffer_size -= 1;
-            rtt_buffer.push(0u8);
-        }
+    pub fn new(buffer_size: usize) -> RttBuffer {
+        let rtt_buffer = vec![0u8; buffer_size.max(1)];
         RttBuffer(rtt_buffer)
     }
 }

@@ -6,10 +6,10 @@ use crate::{
             ApAddress, ArmProbeInterface, DpAddress,
         },
         riscv::{communication_interface::RiscvCommunicationInterface, RiscVState},
+        xtensa::{communication_interface::XtensaCommunicationInterface, XtensaState},
     },
-    Core, CoreType, Error,
+    Core, CoreType, Error, Target,
 };
-pub use probe_rs_target::{Architecture, CoreAccessOptions};
 
 use super::ResolvedCoreOptions;
 
@@ -33,13 +33,18 @@ impl CombinedCoreState {
 
     pub(crate) fn attach_arm<'probe>(
         &'probe mut self,
+        target: &'probe Target,
         arm_interface: &'probe mut Box<dyn ArmProbeInterface>,
     ) -> Result<Core<'probe>, Error> {
+        let memory_regions = &target.memory_map;
+
+        let name = &target.cores[self.id].name;
+
         let memory = arm_interface.memory_interface(self.arm_memory_ap())?;
 
         let (options, debug_sequence) = match &self.core_state.core_access_options {
             ResolvedCoreOptions::Arm { options, sequence } => (options, sequence.clone()),
-            ResolvedCoreOptions::Riscv { .. } => {
+            _ => {
                 return Err(Error::UnableToOpenProbe(
                     "Core architecture and Probe mismatch.",
                 ))
@@ -48,32 +53,45 @@ impl CombinedCoreState {
 
         Ok(match &mut self.specific_state {
             SpecificCoreState::Armv6m(s) => Core::new(
-                crate::architecture::arm::armv6m::Armv6m::new(memory, s, debug_sequence, self.id)?,
+                self.id,
+                name,
+                memory_regions,
+                crate::architecture::arm::armv6m::Armv6m::new(memory, s, debug_sequence)?,
             ),
-            SpecificCoreState::Armv7a(s) => {
-                Core::new(crate::architecture::arm::armv7a::Armv7a::new(
+            SpecificCoreState::Armv7a(s) => Core::new(
+                self.id,
+                name,
+                memory_regions,
+                crate::architecture::arm::armv7a::Armv7a::new(
                     memory,
                     s,
                     options.debug_base.expect("base_address not specified"),
                     debug_sequence,
-                    self.id,
-                )?)
-            }
-            SpecificCoreState::Armv7m(s) | SpecificCoreState::Armv7em(s) => Core::new(
-                crate::architecture::arm::armv7m::Armv7m::new(memory, s, debug_sequence, self.id)?,
+                )?,
             ),
-            SpecificCoreState::Armv8a(s) => {
-                Core::new(crate::architecture::arm::armv8a::Armv8a::new(
+            SpecificCoreState::Armv7m(s) | SpecificCoreState::Armv7em(s) => Core::new(
+                self.id,
+                name,
+                memory_regions,
+                crate::architecture::arm::armv7m::Armv7m::new(memory, s, debug_sequence)?,
+            ),
+            SpecificCoreState::Armv8a(s) => Core::new(
+                self.id,
+                name,
+                memory_regions,
+                crate::architecture::arm::armv8a::Armv8a::new(
                     memory,
                     s,
                     options.debug_base.expect("base_address not specified"),
                     options.cti_base.expect("cti_address not specified"),
                     debug_sequence,
-                    self.id,
-                )?)
-            }
+                )?,
+            ),
             SpecificCoreState::Armv8m(s) => Core::new(
-                crate::architecture::arm::armv8m::Armv8m::new(memory, s, debug_sequence, self.id)?,
+                self.id,
+                name,
+                memory_regions,
+                crate::architecture::arm::armv8m::Armv8m::new(memory, s, debug_sequence)?,
             ),
             _ => {
                 return Err(Error::UnableToOpenProbe(
@@ -87,22 +105,19 @@ impl CombinedCoreState {
         &self,
         interface: &mut dyn ArmProbeInterface,
     ) -> Result<(), Error> {
-        let (sequence_handle, arm_core_access_options) = match &self.core_state.core_access_options
-        {
-            ResolvedCoreOptions::Arm { sequence, options } => (sequence, options),
-            ResolvedCoreOptions::Riscv { .. } => {
-                panic!("This should never happen. Please file a bug if it does.");
-            }
+        let ResolvedCoreOptions::Arm { sequence, options } = &self.core_state.core_access_options
+        else {
+            unreachable!("This should never happen. Please file a bug if it does.");
         };
 
         tracing::debug_span!("debug_core_start", id = self.id()).in_scope(|| {
             // Enable debug mode
-            sequence_handle.debug_core_start(
+            sequence.debug_core_start(
                 interface,
                 self.arm_memory_ap(),
                 self.core_type(),
-                arm_core_access_options.debug_base,
-                arm_core_access_options.cti_base,
+                options.debug_base,
+                options.cti_base,
             )
         })?;
 
@@ -113,22 +128,15 @@ impl CombinedCoreState {
         &self,
         interface: &mut dyn ArmProbeInterface,
     ) -> Result<(), Error> {
-        let (sequence_handle, arm_core_access_options) = match &self.core_state.core_access_options
-        {
-            ResolvedCoreOptions::Arm { sequence, options } => (sequence, options),
-            ResolvedCoreOptions::Riscv { .. } => {
-                panic!("This should never happen. Please file a bug if it does.");
-            }
+        let ResolvedCoreOptions::Arm { sequence, options } = &self.core_state.core_access_options
+        else {
+            unreachable!("This should never happen. Please file a bug if it does.");
         };
 
         let mut memory_interface = interface.memory_interface(self.arm_memory_ap())?;
 
         let reset_catch_span = tracing::debug_span!("reset_catch_set", id = self.id()).entered();
-        sequence_handle.reset_catch_set(
-            &mut *memory_interface,
-            self.core_type(),
-            arm_core_access_options.debug_base,
-        )?;
+        sequence.reset_catch_set(&mut *memory_interface, self.core_type(), options.debug_base)?;
 
         drop(reset_catch_span);
 
@@ -137,12 +145,55 @@ impl CombinedCoreState {
 
     pub(crate) fn attach_riscv<'probe>(
         &'probe mut self,
+        target: &'probe Target,
         interface: &'probe mut RiscvCommunicationInterface,
     ) -> Result<Core<'probe>, Error> {
+        let memory_regions = &target.memory_map;
+        let name = &target.cores[self.id].name;
+
+        let options = match &self.core_state.core_access_options {
+            ResolvedCoreOptions::Riscv { options } => options,
+            _ => {
+                return Err(Error::UnableToOpenProbe(
+                    "Core architecture and Probe mismatch.",
+                ))
+            }
+        };
+
         Ok(match &mut self.specific_state {
-            SpecificCoreState::Riscv(s) => Core::new(crate::architecture::riscv::Riscv32::new(
-                interface, s, self.id,
-            )),
+            SpecificCoreState::Riscv(s) => Core::new(
+                self.id,
+                name,
+                memory_regions,
+                crate::architecture::riscv::Riscv32::new(
+                    options.hart_id.unwrap_or_default(),
+                    interface,
+                    s,
+                )?,
+            ),
+            _ => {
+                return Err(Error::UnableToOpenProbe(
+                    "Core architecture and Probe mismatch.",
+                ))
+            }
+        })
+    }
+
+    pub(crate) fn attach_xtensa<'probe>(
+        &'probe mut self,
+        target: &'probe Target,
+        interface: &'probe mut XtensaCommunicationInterface,
+    ) -> Result<Core<'probe>, Error> {
+        let memory_regions = &target.memory_map;
+        let name = &target.cores[self.id].name;
+
+        Ok(match &mut self.specific_state {
+            SpecificCoreState::Xtensa(s) => Core::new(
+                self.id,
+                name,
+                memory_regions,
+                crate::architecture::xtensa::Xtensa::new(interface, s),
+            ),
             _ => {
                 return Err(Error::UnableToOpenProbe(
                     "Core architecture and Probe mismatch.",
@@ -177,11 +228,9 @@ impl CoreState {
     }
 
     pub(crate) fn memory_ap(&self) -> MemoryAp {
-        let arm_core_access_options = match &self.core_access_options {
-            ResolvedCoreOptions::Arm { options, .. } => options,
-            ResolvedCoreOptions::Riscv { .. } => {
-                panic!("This should never happen. Please file a bug if it does.")
-            }
+        let arm_core_access_options = match self.core_access_options {
+            ResolvedCoreOptions::Arm { ref options, .. } => options,
+            _ => unreachable!("This should never happen. Please file a bug if it does."),
         };
 
         let dp = match arm_core_access_options.psel {
@@ -215,6 +264,8 @@ pub enum SpecificCoreState {
     Armv8m(CortexMState),
     /// The state of an RISC-V core.
     Riscv(RiscVState),
+    /// The state of an Xtensa core.
+    Xtensa(XtensaState),
 }
 
 impl SpecificCoreState {
@@ -227,6 +278,7 @@ impl SpecificCoreState {
             CoreType::Armv8a => SpecificCoreState::Armv8a(CortexAState::new()),
             CoreType::Armv8m => SpecificCoreState::Armv8m(CortexMState::new()),
             CoreType::Riscv => SpecificCoreState::Riscv(RiscVState::new()),
+            CoreType::Xtensa => SpecificCoreState::Xtensa(XtensaState::new()),
         }
     }
 
@@ -239,6 +291,7 @@ impl SpecificCoreState {
             SpecificCoreState::Armv8a(_) => CoreType::Armv8a,
             SpecificCoreState::Armv8m(_) => CoreType::Armv8m,
             SpecificCoreState::Riscv(_) => CoreType::Riscv,
+            SpecificCoreState::Xtensa(_) => CoreType::Xtensa,
         }
     }
 }

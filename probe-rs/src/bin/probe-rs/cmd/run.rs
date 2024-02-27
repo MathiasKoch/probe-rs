@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
@@ -6,17 +5,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use probe_rs::debug::DebugInfo;
-use probe_rs::flashing::{FileDownloadError, Format};
-use probe_rs::{BreakpointCause, Core, HaltReason, SemihostingCommand, VectorCatchCondition};
+use anyhow::{anyhow, Result};
+use probe_rs::debug::{DebugInfo, DebugRegisters};
+use probe_rs::rtt::ScanRegion;
+use probe_rs::{
+    exception_handler_for_core, probe::list::Lister, BreakpointCause, Core, CoreInterface, Error,
+    HaltReason, SemihostingCommand, VectorCatchCondition,
+};
 use probe_rs_target::MemoryRegion;
 use signal_hook::consts::signal;
 use time::UtcOffset;
 
 use crate::util::common_options::{BinaryDownloadOptions, ProbeOptions};
-use crate::util::flash::run_flash_download;
-use crate::util::rtt::{self, RttConfig};
+use crate::util::flash::{build_loader, run_flash_download};
+use crate::util::rtt::{self, RttActiveTarget, RttConfig};
 use crate::FormatOptions;
 
 const RTT_RETRIES: usize = 10;
@@ -49,32 +51,31 @@ pub struct Cmd {
 
     #[clap(long)]
     pub(crate) log_format: Option<String>,
+
+    /// Enable reset vector catch if its supported on the target.
+    #[arg(long)]
+    pub catch_reset: bool,
+    /// Enable hardfault vector catch if its supported on the target.
+    #[arg(long)]
+    pub catch_hardfault: bool,
+
+    /// Scan the memory to find the RTT control block
+    #[clap(long)]
+    pub(crate) rtt_scan_memory: bool,
 }
 
 impl Cmd {
-    pub fn run(self, run_download: bool, timestamp_offset: UtcOffset) -> Result<()> {
-        let (mut session, probe_options) = self.probe_options.simple_attach()?;
+    pub fn run(
+        self,
+        lister: &Lister,
+        run_download: bool,
+        timestamp_offset: UtcOffset,
+    ) -> Result<()> {
+        let (mut session, probe_options) = self.probe_options.simple_attach(lister)?;
         let path = Path::new(&self.path);
 
         if run_download {
-            let mut file = match File::open(&self.path) {
-                Ok(file) => file,
-                Err(e) => {
-                    return Err(FileDownloadError::IO(e)).context("Failed to open binary file.")
-                }
-            };
-
-            let mut loader = session.target().flash_loader();
-
-            let format = self.format_options.into_format()?;
-            match format {
-                Format::Bin(options) => loader.load_bin_data(&mut file, options),
-                Format::Elf => loader.load_elf_data(&mut file),
-                Format::Hex => loader.load_hex_data(&mut file),
-                Format::Idf(options) => loader.load_idf_data(&mut session, &mut file, options),
-                Format::Uf2 => loader.load_uf2_data(&mut file),
-            }?;
-
+            let loader = build_loader(&mut session, path, self.format_options)?;
             run_flash_download(
                 &mut session,
                 path,
@@ -83,19 +84,35 @@ impl Cmd {
                 loader,
                 self.chip_erase,
             )?;
+            // reset the core to leave it in a consistent state after flashing
+            session
+                .core(0)?
+                .reset_and_halt(Duration::from_millis(100))?;
         }
 
         let memory_map = session.target().memory_map.clone();
-        let rtt_scan_regions = session.target().rtt_scan_regions.clone();
+        let rtt_scan_regions = match self.rtt_scan_memory {
+            true => session.target().rtt_scan_regions.clone(),
+            false => Vec::new(),
+        };
         let mut core = session.core(0)?;
 
-        if run_download {
-            core.reset_and_halt(Duration::from_millis(100))?;
-            if let Err(e) = core.enable_vector_catch(VectorCatchCondition::All) {
-                tracing::error!("Failed to enable_vector_catch: {:?}", e);
+        if self.catch_hardfault || self.catch_reset {
+            core.halt(Duration::from_millis(100))?;
+            if self.catch_hardfault {
+                match core.enable_vector_catch(VectorCatchCondition::HardFault) {
+                    Ok(_) | Err(Error::NotImplemented(_)) => {} // Don't output an error if vector_catch hasn't been implemented
+                    Err(e) => tracing::error!("Failed to enable_vector_catch: {:?}", e),
+                }
             }
-            core.run()?;
+            if self.catch_reset {
+                match core.enable_vector_catch(VectorCatchCondition::CoreReset) {
+                    Ok(_) | Err(Error::NotImplemented(_)) => {} // Don't output an error if vector_catch hasn't been implemented
+                    Err(e) => tracing::error!("Failed to enable_vector_catch: {:?}", e),
+                }
+            }
         }
+        core.run()?;
 
         run_loop(
             &mut core,
@@ -112,7 +129,7 @@ impl Cmd {
     }
 }
 
-/// Print all RTT messsages and a stacktrace when the core stops due to an
+/// Print all RTT messages and a stacktrace when the core stops due to an
 /// exception or when ctrl + c is pressed.
 ///
 /// Returns `Ok(())` if the core gracefully halted, or an error.
@@ -148,11 +165,28 @@ fn run_loop(
     let sig_id = signal_hook::flag::register(signal::SIGINT, exit.clone())?;
 
     let mut stdout = std::io::stdout();
-    while !exit.load(Ordering::Relaxed) {
-        let had_rtt_data = poll_rtt(&mut rtta, core, &mut stdout)?;
-        if poll_stacktrace(core, path)? {
-            return Ok(());
+    let mut halt_reason = None;
+    while !exit.load(Ordering::Relaxed) && halt_reason.is_none() {
+        // check for halt first, poll rtt after.
+        // this is important so we do one last poll after halt, so we flush all messages
+        // the core printed before halting, such as a panic message.
+        match core.status()? {
+            probe_rs::CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Semihosting(
+                SemihostingCommand::Unknown { operation },
+            ))) => {
+                tracing::error!("Target wanted to run semihosting operation {:#x}, but probe-rs does not support this operation yet. Continuing...", operation);
+                core.run()?;
+            }
+            probe_rs::CoreStatus::Halted(r) => halt_reason = Some(r),
+            probe_rs::CoreStatus::Running
+            | probe_rs::CoreStatus::LockedUp
+            | probe_rs::CoreStatus::Sleeping
+            | probe_rs::CoreStatus::Unknown => {
+                // Carry on
+            }
         }
+
+        let had_rtt_data = poll_rtt(&mut rtta, core, &mut stdout)?;
 
         // Poll RTT with a frequency of 10 Hz if we do not receive any new data.
         // Once we receive new data, we bump the frequency to 1kHz.
@@ -165,60 +199,53 @@ fn run_loop(
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    let manually_halted = exit.load(Ordering::Relaxed);
 
-    if manually_halted {
-        core.halt(Duration::from_secs(1))?;
-        if always_print_stacktrace {
-            poll_stacktrace(core, path)?;
+    let result = match halt_reason {
+        None => {
+            // manually halted with Control+C. Stop the core.
+            core.halt(Duration::from_secs(1))?;
+            Ok(())
         }
+        Some(reason) => match reason {
+            HaltReason::Breakpoint(BreakpointCause::Semihosting(
+                SemihostingCommand::ExitSuccess,
+            )) => Ok(()),
+            HaltReason::Breakpoint(BreakpointCause::Semihosting(
+                SemihostingCommand::ExitError { code },
+            )) => Err(anyhow!(
+                "Semihosting indicates exit with failure code: {code:#08x} ({code})"
+            )),
+            _ => Err(anyhow!("CPU halted unexpectedly.")),
+        },
+    };
+
+    if always_print_stacktrace || result.is_err() {
+        print_stacktrace(core, path)?;
     }
 
     signal_hook::low_level::unregister(sig_id);
     signal_hook::flag::register_conditional_default(signal::SIGINT, exit)?;
-    Ok(())
-}
 
-/// Try to fetch the necessary data of the core to print its stacktrace.
-///
-/// Returns `Ok(true)` if the debuger should stop polling, or `Ok(false)` if the
-/// polling should continue, or an error.
-fn poll_stacktrace(core: &mut Core<'_>, path: &Path) -> Result<bool> {
-    let status = core.status()?;
-    match status {
-        probe_rs::CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Semihosting(
-            SemihostingCommand::ExitSuccess,
-        ))) => Ok(true),
-        probe_rs::CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Semihosting(
-            SemihostingCommand::ExitError { code },
-        ))) => Err(anyhow!(
-            "Semihosting indicates exit with failure code: {code:#08x} ({code})"
-        )),
-        probe_rs::CoreStatus::Halted(_reason) => {
-            // Try and give the user some info as to why it halted.
-            print_stacktrace(core, path)?;
-            // Report this as an error
-            Err(anyhow!("CPU halted unexpectedly."))
-        }
-        probe_rs::CoreStatus::Running
-        | probe_rs::CoreStatus::LockedUp
-        | probe_rs::CoreStatus::Sleeping
-        | probe_rs::CoreStatus::Unknown => {
-            // Carry on
-            Ok(false)
-        }
-    }
+    result
 }
 
 /// Prints the stacktrace of the current execution state.
-fn print_stacktrace(core: &mut Core<'_>, path: &Path) -> Result<(), anyhow::Error> {
+fn print_stacktrace(core: &mut impl CoreInterface, path: &Path) -> Result<(), anyhow::Error> {
     let Some(debug_info) = DebugInfo::from_file(path).ok() else {
-        log::error!("No debug info found.");
+        tracing::error!("No debug info found.");
         return Ok(());
     };
-
-    let stack_frames = debug_info.unwind(core).unwrap();
-
+    let initial_registers = DebugRegisters::from_core(core);
+    let exception_interface = exception_handler_for_core(core.core_type());
+    let instruction_set = core.instruction_set().ok();
+    let stack_frames = debug_info
+        .unwind(
+            core,
+            initial_registers,
+            exception_interface.as_ref(),
+            instruction_set,
+        )
+        .unwrap();
     for (i, frame) in stack_frames.iter().enumerate() {
         print!("Frame {}: {} @ {}", i, frame.function_name, frame.pc);
 
@@ -289,23 +316,28 @@ fn attach_to_rtt(
     timestamp_offset: UtcOffset,
     log_format: Option<&str>,
 ) -> Option<rtt::RttActiveTarget> {
+    let scan_regions = ScanRegion::Ranges(scan_regions.to_vec());
     for _ in 0..RTT_RETRIES {
-        match rtt::attach_to_rtt(
-            core,
-            memory_map,
-            scan_regions,
-            path,
-            &rtt_config,
-            timestamp_offset,
-            log_format,
-        ) {
-            Ok(target_rtt) => return Some(target_rtt),
-            Err(error) => {
-                log::debug!("{:?} RTT attach error", error);
+        match rtt::attach_to_rtt(core, memory_map, &scan_regions, path) {
+            Ok(Some(target_rtt)) => {
+                let app = RttActiveTarget::new(
+                    target_rtt,
+                    path,
+                    &rtt_config,
+                    timestamp_offset,
+                    log_format,
+                );
+
+                match app {
+                    Ok(app) => return Some(app),
+                    Err(error) => tracing::debug!("{:?} RTT attach error", error),
+                }
             }
+            Ok(None) => return None,
+            Err(error) => tracing::debug!("{:?} RTT attach error", error),
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    log::error!("Failed to attach to RTT continuing...");
+    tracing::error!("Failed to attach to RTT, continuing...");
     None
 }

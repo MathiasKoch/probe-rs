@@ -35,13 +35,16 @@ use super::ArtifactError;
 
 use std::{fs::File, path::Path, path::PathBuf};
 
-use crate::util::parse_u64;
+use crate::util::{logging::LevelFilter, parse_u64};
 use clap;
 use probe_rs::{
     config::{RegistryError, TargetSelector},
     flashing::{FileDownloadError, FlashError},
-    DebugProbeError, DebugProbeSelector, FakeProbe, Permissions, Probe, Session, Target,
-    WireProtocol,
+    integration::FakeProbe,
+    probe::{
+        list::Lister, DebugProbeError, DebugProbeInfo, DebugProbeSelector, Probe, WireProtocol,
+    },
+    Permissions, Session, Target,
 };
 use serde::{Deserialize, Serialize};
 
@@ -53,9 +56,10 @@ pub struct FlashOptions {
     pub reset_halt: bool,
     /// Use this flag to set the log level.
     ///
-    /// Default is `warning`. Possible choices are [error, warning, info, debug, trace].
+    /// Configurable via the `RUST_LOG` environment variable.
+    /// Default is `warn`. Possible choices are [error, warn, info, debug, trace].
     #[arg(value_name = "level", long)]
-    pub log: Option<log::Level>,
+    pub log: Option<LevelFilter>,
     /// The path to the file to be flashed.
     #[arg(value_name = "path", long)]
     pub path: Option<PathBuf>,
@@ -123,33 +127,41 @@ pub struct ReadWriteOptions {
 /// Common options and logic when interfacing with a [Probe].
 #[derive(clap::Parser, Debug)]
 pub struct ProbeOptions {
-    #[arg(long)]
+    #[arg(long, env = "PROBE_RS_CHIP")]
     pub chip: Option<String>,
-    #[arg(value_name = "chip description file path", long)]
+    #[arg(
+        value_name = "chip description file path",
+        long,
+        env = "PROBE_RS_CHIP_DESCRIPTION_PATH"
+    )]
     pub chip_description_path: Option<PathBuf>,
 
     /// Protocol used to connect to chip. Possible options: [swd, jtag]
-    #[arg(long, help_heading = "PROBE CONFIGURATION")]
+    #[arg(long, env = "PROBE_RS_PROTOCOL", help_heading = "PROBE CONFIGURATION")]
     pub protocol: Option<WireProtocol>,
 
     /// Use this flag to select a specific probe in the list.
     ///
     /// Use '--probe VID:PID' or '--probe VID:PID:Serial' if you have more than one
     /// probe with the same VID:PID.",
-    #[arg(long = "probe", help_heading = "PROBE CONFIGURATION")]
+    #[arg(
+        long = "probe",
+        env = "PROBE_RS_PROBE",
+        help_heading = "PROBE CONFIGURATION"
+    )]
     pub probe_selector: Option<DebugProbeSelector>,
     /// The protocol speed in kHz.
-    #[arg(long, help_heading = "PROBE CONFIGURATION")]
+    #[arg(long, env = "PROBE_RS_SPEED", help_heading = "PROBE CONFIGURATION")]
     pub speed: Option<u32>,
     /// Use this flag to assert the nreset & ntrst pins during attaching the probe to
     /// the chip.
-    #[arg(long)]
+    #[arg(long, env = "PROBE_RS_CONNECT_UNDER_RESET")]
     pub connect_under_reset: bool,
-    #[arg(long)]
+    #[arg(long, env = "PROBE_RS_DRY_RUN")]
     pub dry_run: bool,
     /// Use this flag to allow all memory, including security keys and 3rd party
     /// firmware, to be erased even when it has read-only protection.
-    #[arg(long)]
+    #[arg(long, env = "PROBE_RS_ALLOW_ERASE_ALL")]
     pub allow_erase_all: bool,
 }
 
@@ -160,11 +172,14 @@ impl ProbeOptions {
 
     /// Convenience method that attaches to the specified probe, target,
     /// and target session.
-    pub fn simple_attach(self) -> Result<(Session, LoadedProbeOptions), OperationError> {
+    pub fn simple_attach(
+        self,
+        lister: &Lister,
+    ) -> Result<(Session, LoadedProbeOptions), OperationError> {
         let common_options = self.load()?;
 
         let target = common_options.get_target_selector()?;
-        let probe = common_options.attach_probe()?;
+        let probe = common_options.attach_probe(lister)?;
         let session = common_options.attach_session(probe, target)?;
 
         Ok((session, common_options))
@@ -186,7 +201,7 @@ impl LoadedProbeOptions {
     }
 
     /// Add targets contained in file given by --chip-description-path
-    /// to probe-rs registery.
+    /// to probe-rs registry.
     ///
     /// Note: should be called before [FlashOptions::early_exit] and any other functions in [ProbeOptions].
     fn maybe_load_chip_desc(&self) -> Result<(), OperationError> {
@@ -227,34 +242,32 @@ impl LoadedProbeOptions {
     }
 
     /// Attaches to specified probe and configures it.
-    pub fn attach_probe(&self) -> Result<Probe, OperationError> {
-        let mut probe = {
-            if self.0.dry_run {
-                Probe::from_specific_probe(Box::new(FakeProbe::new()));
-            }
-
+    pub fn attach_probe(&self, lister: &Lister) -> Result<Probe, OperationError> {
+        let mut probe = if self.0.dry_run {
+            Probe::from_specific_probe(Box::new(FakeProbe::with_mocked_core()))
+        } else {
             // If we got a probe selector as an argument, open the probe
             // matching the selector if possible.
-            match &self.0.probe_selector {
-                Some(selector) => {
-                    Probe::open(selector.clone()).map_err(OperationError::FailedToOpenProbe)
-                }
+            let probe = match &self.0.probe_selector {
+                Some(selector) => lister.open(selector),
                 None => {
                     // Only automatically select a probe if there is
                     // only a single probe detected.
-                    let list = Probe::list_all();
+                    let list = lister.list_all();
                     if list.len() > 1 {
-                        return Err(OperationError::MultipleProbesFound { number: list.len() });
+                        return Err(OperationError::MultipleProbesFound { list });
                     }
 
-                    if let Some(info) = list.first() {
-                        Probe::open(info).map_err(OperationError::FailedToOpenProbe)
-                    } else {
-                        Err(OperationError::NoProbesFound)
-                    }
+                    let Some(info) = list.first() else {
+                        return Err(OperationError::NoProbesFound);
+                    };
+
+                    lister.open(info)
                 }
-            }
-        }?;
+            };
+
+            probe.map_err(OperationError::FailedToOpenProbe)?
+        };
 
         if let Some(protocol) = self.0.protocol {
             // Select protocol and speed
@@ -279,7 +292,7 @@ impl LoadedProbeOptions {
             let protocol_speed = probe.speed_khz();
             if let Some(speed) = self.0.speed {
                 if protocol_speed < speed {
-                    log::warn!(
+                    tracing::warn!(
                         "Unable to use specified speed of {} kHz, actual speed used is {} kHz",
                         speed,
                         protocol_speed
@@ -287,7 +300,7 @@ impl LoadedProbeOptions {
                 }
             }
 
-            log::info!("Protocol speed {} kHz", protocol_speed);
+            tracing::info!("Protocol speed {} kHz", protocol_speed);
         }
 
         Ok(probe)
@@ -470,8 +483,8 @@ pub enum OperationError {
     FailedToLoadElfData(#[source] FileDownloadError),
     #[error("Failed to open the debug probe.")]
     FailedToOpenProbe(#[source] DebugProbeError),
-    #[error("{number} probes were found.")]
-    MultipleProbesFound { number: usize },
+    #[error("{} probes were found: {}", .list.len(), print_list(.list))]
+    MultipleProbesFound { list: Vec<DebugProbeInfo> },
     #[error("The flashing procedure failed for '{path}'.")]
     FlashingFailed {
         #[source]
@@ -540,6 +553,17 @@ pub enum OperationError {
     IOError(#[source] std::io::Error),
     #[error("Failed to parse CLI arguments.")]
     CliArgument(#[from] clap::Error),
+}
+
+/// Used in errors it can print a list of items.
+fn print_list(list: &[impl std::fmt::Debug]) -> String {
+    let mut output = String::new();
+
+    for (i, entry) in list.iter().enumerate() {
+        output.push_str(&format!("\n    {}. {:?}", i + 1, entry));
+    }
+
+    output
 }
 
 impl From<std::io::Error> for OperationError {

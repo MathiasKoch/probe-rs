@@ -98,10 +98,12 @@ pub enum FileDownloadError {
     /// This is most likely because of a bad linker script.
     #[error("No loadable ELF sections were found.")]
     NoLoadableSegments,
+    /// Some error returned by the flash size detection.
+    #[error("Could not determine flash size.")]
+    FlashSizeDetection(#[from] crate::Error),
 }
 
 /// Options for downloading a file onto a target chip.
-///
 ///
 /// This struct should be created using the [`DownloadOptions::default()`] function, and can be configured by setting
 /// the fields directly:
@@ -149,7 +151,7 @@ impl DownloadOptions {
 
 /// Downloads a file of given `format` at `path` to the flash of the target given in `session`.
 ///
-/// This will ensure that memory bounderies are honored and does unlocking, erasing and programming of the flash for you.
+/// This will ensure that memory boundaries are honored and does unlocking, erasing and programming of the flash for you.
 ///
 /// If you are looking for more options, have a look at [download_file_with_options].
 pub fn download_file<P: AsRef<Path>>(
@@ -162,7 +164,7 @@ pub fn download_file<P: AsRef<Path>>(
 
 /// Downloads a file of given `format` at `path` to the flash of the target given in `session`.
 ///
-/// This will ensure that memory bounderies are honored and does unlocking, erasing and programming of the flash for you.
+/// This will ensure that memory boundaries are honored and does unlocking, erasing and programming of the flash for you.
 ///
 /// If you are looking for a simple version without many options, have a look at [download_file].
 pub fn download_file_with_options<P: AsRef<Path>>(
@@ -171,10 +173,7 @@ pub fn download_file_with_options<P: AsRef<Path>>(
     format: Format,
     options: DownloadOptions,
 ) -> Result<(), FileDownloadError> {
-    let mut file = match File::open(path.as_ref()) {
-        Ok(file) => file,
-        Err(e) => return Err(FileDownloadError::IO(e)),
-    };
+    let mut file = File::open(path.as_ref()).map_err(FileDownloadError::IO)?;
 
     let mut loader = session.target().flash_loader();
 
@@ -191,7 +190,7 @@ pub fn download_file_with_options<P: AsRef<Path>>(
         .map_err(FileDownloadError::Flash)
 }
 
-/// Flash data which was extraced from an ELF file.
+/// Flash data which was extracted from an ELF file.
 pub(super) struct ExtractedFlashData<'data> {
     pub(super) section_names: Vec<String>,
     pub(super) address: u32,
