@@ -5,7 +5,6 @@ use super::Command;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use std::convert::TryInto;
 use std::{cmp, fmt};
 
 use super::JLink;
@@ -36,7 +35,7 @@ impl SpeedInfo {
 /// Target communication speed setting.
 ///
 /// This determines the clock frequency of the target communication. Supported speeds for the
-/// currently selected target interface can be fetched via [`JayLink::read_speeds`].
+/// currently selected target interface can be fetched via [`JLink::read_speeds`].
 #[derive(Debug, Copy, Clone)]
 pub struct SpeedConfig {
     raw: u16,

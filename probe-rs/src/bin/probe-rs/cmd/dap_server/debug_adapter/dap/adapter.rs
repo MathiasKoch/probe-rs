@@ -37,7 +37,7 @@ use probe_rs::{
 use serde::{de::DeserializeOwned, Serialize};
 use typed_path::NativePathBuf;
 
-use std::{convert::TryInto, str, string::ToString, time::Duration};
+use std::{fmt::Display, str, time::Duration};
 
 /// Progress ID used for progress reporting when the debug adapter protocol is used.
 type ProgressId = i64;
@@ -785,12 +785,14 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all, name = "Handle configuration done")]
     pub(crate) fn configuration_done(
         &mut self,
         target_core: &mut CoreHandle,
         request: &Request,
     ) -> Result<()> {
         let current_core_status = target_core.core.status()?;
+
         if current_core_status.is_halted() {
             if self.halt_after_reset
                 || matches!(
@@ -816,9 +818,11 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
                 });
                 self.send_event("stopped", event_body)?;
             } else {
+                tracing::debug!("Core is halted, but not due to a breakpoint and halt_after_reset is not set. Continuing.");
                 self.r#continue(target_core, request)?;
             }
         }
+
         self.configuration_done = true;
         self.send_response::<()>(request, Ok(None))
     }
@@ -1538,58 +1542,46 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
         target_core: &mut CoreHandle,
         request: &Request,
     ) -> Result<()> {
-        match target_core.core.run() {
-            Ok(_) => {
-                target_core.reset_core_status(self);
-                if request.command.as_str() == "continue" {
-                    // If this continue was initiated as part of some other request, then do not respond.
-                    self.send_response(
-                        request,
-                        Ok(Some(ContinueResponseBody {
-                            all_threads_continued: Some(false), // TODO: Implement multi-core logic here
-                        })),
-                    )?;
-                }
-                // We have to consider the fact that sometimes the `run()` is successfull,
-                // but "immediately" afterwards, the MCU hits a breakpoint or exception.
-                // So we have to check the status again to be sure.
-                match if target_core.core_data.breakpoints.is_empty() {
-                    target_core
-                        .core
-                        .wait_for_core_halted(Duration::from_millis(200))
-                } else {
-                    // Use slightly longer timeout when we know there breakpoints configured.
-                    target_core
-                        .core
-                        .wait_for_core_halted(Duration::from_millis(500))
-                } {
-                    Ok(_) => {
-                        // The core has halted, so we can proceed.
-                    }
-                    Err(wait_error) => {
-                        if matches!(
-                            wait_error,
-                            Error::Arm(ArmError::Timeout)
-                                | Error::Riscv(RiscvError::Timeout)
-                                | Error::Xtensa(XtensaError::Timeout)
-                        ) {
-                            // The core is still running.
-                        } else {
-                            // Some other error occurred, so we have to send an error response.
-                            return Err(wait_error.into());
-                        }
-                    }
-                }
+        if let Err(error) = target_core.core.run() {
+            self.send_response::<()>(request, Err(&DebuggerError::Other(anyhow!("{}", error))))?;
+            return Err(error.into());
+        }
 
-                Ok(())
-            }
-            Err(error) => {
-                self.send_response::<()>(
-                    request,
-                    Err(&DebuggerError::Other(anyhow!("{}", error))),
-                )?;
-                Err(error.into())
-            }
+        target_core.reset_core_status(self);
+
+        if request.command.as_str() == "continue" {
+            // If this continue was initiated as part of some other request, then do not respond.
+            self.send_response(
+                request,
+                Ok(Some(ContinueResponseBody {
+                    all_threads_continued: Some(false), // TODO: Implement multi-core logic here
+                })),
+            )?;
+        }
+        // We have to consider the fact that sometimes the `run()` is successfull,
+        // but "immediately" afterwards, the MCU hits a breakpoint or exception.
+        // So we have to check the status again to be sure.
+
+        // If there are breakpoints configured, we wait a bit longer
+        let wait_timeout = if target_core.core_data.breakpoints.is_empty() {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_millis(500)
+        };
+
+        tracing::trace!("Checking if core halts again after continue, timeout = {wait_timeout:?}");
+
+        match target_core.core.wait_for_core_halted(wait_timeout) {
+            // The core has halted, so we can proceed.
+            Ok(_) => Ok(()),
+            // The core is still running.
+            Err(
+                Error::Arm(ArmError::Timeout)
+                | Error::Riscv(RiscvError::Timeout)
+                | Error::Xtensa(XtensaError::Timeout),
+            ) => Ok(()),
+            // Some other error occurred, so we have to send an error response.
+            Err(wait_error) => Err(wait_error.into()),
         }
     }
 
@@ -1655,15 +1647,15 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
         {
             Ok((new_status, program_counter)) => (new_status, program_counter),
             Err(error) => match &error {
-                probe_rs::debug::DebugError::IncompleteDebugInfo {
-                    message,
-                    pc_at_error,
-                } => {
+                probe_rs::debug::DebugError::WarnAndContinue { message } => {
+                    let pc_at_error = target_core
+                        .core
+                        .read_core_reg(target_core.core.program_counter())?;
                     self.show_message(
                         MessageSeverity::Information,
                         format!("Step error @{pc_at_error:#010X}: {message}"),
                     );
-                    (target_core.core.status()?, *pc_at_error)
+                    (target_core.core.status()?, pc_at_error)
                 }
                 other_error => {
                     target_core.core.halt(Duration::from_millis(100)).ok();
@@ -1755,6 +1747,7 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
         event_type: &str,
         event_body: Option<S>,
     ) -> Result<()> {
+        tracing::debug!("Sending event: {}", event_type);
         self.adapter.send_event(event_type, event_body)
     }
 
@@ -1775,31 +1768,27 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
         channel_name: String,
         data_format: rtt::DataFormat,
     ) -> bool {
-        let event_body = match serde_json::to_value(RttChannelEventBody {
+        let Ok(event_body) = serde_json::to_value(RttChannelEventBody {
             channel_number,
             channel_name,
             data_format,
-        }) {
-            Ok(event_body) => event_body,
-            Err(_) => {
-                return false;
-            }
+        }) else {
+            return false;
         };
+
         self.send_event("probe-rs-rtt-channel-config", Some(event_body))
             .is_ok()
     }
 
     /// Send a custom `probe-rs-rtt-data` event to the MS DAP Client, to
     pub fn rtt_output(&mut self, channel_number: usize, rtt_data: String) -> bool {
-        let event_body = match serde_json::to_value(RttDataEventBody {
+        let Ok(event_body) = serde_json::to_value(RttDataEventBody {
             channel_number,
             data: rtt_data,
-        }) {
-            Ok(event_body) => event_body,
-            Err(_) => {
-                return false;
-            }
+        }) else {
+            return false;
         };
+
         self.send_event("probe-rs-rtt-data", Some(event_body))
             .is_ok()
     }
@@ -1859,7 +1848,7 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
     pub fn update_progress(
         &mut self,
         progress: Option<f64>,
-        message: Option<impl Into<String>>,
+        message: Option<impl Display>,
         progress_id: i64,
     ) -> Result<ProgressId> {
         anyhow::ensure!(
@@ -1867,11 +1856,17 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
             "Progress reporting is not supported by client."
         );
 
+        let percentage = progress.map(|progress| progress * 100.0);
+
         self.send_event(
             "progressUpdate",
             Some(ProgressUpdateEventBody {
-                message: message.map(|v| v.into()),
-                percentage: progress.map(|progress| progress * 100.0),
+                message: message.map(|msg| match percentage {
+                    None => msg.to_string(),
+                    Some(percentage) if percentage == 100.0 => msg.to_string(),
+                    Some(percentage) => format!("{msg} ({percentage:02.0}%)"),
+                }),
+                percentage,
                 progress_id: progress_id.to_string(),
             }),
         )?;

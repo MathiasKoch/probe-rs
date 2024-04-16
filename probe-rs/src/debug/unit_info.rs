@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use super::{
     debug_info::*, extract_byte_size, extract_file, extract_line, function_die::FunctionDie,
     variable::*, DebugError, DebugRegisters, EndianReader, VariableCache,
@@ -6,7 +8,10 @@ use crate::{
     debug::{language, stack_frame::StackFrameInfo},
     MemoryInterface,
 };
-use gimli::{AttributeValue, DebugInfoOffset, EvaluationResult, Location, UnitOffset};
+use gimli::{
+    AttributeValue, DebugInfoOffset, DebuggingInformationEntry, EvaluationResult, Location,
+    UnitOffset,
+};
 
 /// The result of `UnitInfo::evaluate_expression()` can be the value of a variable, or a memory location.
 pub(crate) enum ExpressionResult {
@@ -54,131 +59,89 @@ impl UnitInfo {
         )))
     }
     /// Get the DIEs for the function containing the given address.
-    ///
-    /// If `find_inlined` is `false`, then the result will contain a single [`FunctionDie`]
-    /// If `find_inlined` is `true`, then the result will contain a  [`Vec<FunctionDie>`], where the innermost (deepest in the stack) function die is the last entry in the Vec.
-    pub(crate) fn get_function_dies(
-        &self,
-        debug_info: &super::DebugInfo,
+    /// - The first entry in the vector will be the outermost function containing the address.
+    /// - If the address is inlined, the innermost function will be the last entry in the vector.
+    pub(crate) fn get_function_dies<'debug_info>(
+        &'debug_info self,
+        debug_info: &'debug_info super::DebugInfo,
         address: u64,
-        find_inlined: bool,
     ) -> Result<Vec<FunctionDie>, DebugError> {
         tracing::trace!("Searching Function DIE for address {:#x}", address);
 
         let mut entries_cursor = self.unit.entries();
         while let Ok(Some((_depth, current))) = entries_cursor.next_dfs() {
-            let Some(mut die) = FunctionDie::new(current.clone(), self) else {
+            let Some(die) = FunctionDie::new(current.clone(), self, debug_info, address)? else {
                 continue;
             };
 
-            let mut ranges = debug_info.dwarf.die_ranges(&self.unit, current)?;
+            let mut functions = vec![die];
+            tracing::debug!(
+                "Found DIE: name={:?}",
+                functions[0].function_name(debug_info)
+            );
 
-            while let Ok(Some(range)) = ranges.next() {
-                if !range.contains(address) {
-                    continue;
-                }
+            tracing::debug!("Checking for inlined functions");
+            let inlined_functions =
+                self.find_inlined_functions(debug_info, address, current.offset())?;
+            tracing::debug!(
+                "{} inlined functions for address {}",
+                inlined_functions.len(),
+                address
+            );
 
-                // Check if we are actually in an inlined function
-                die.low_pc = range.begin;
-                die.high_pc = range.end;
-
-                // Extract the frame_base for this function DIE.
-                let mut functions = vec![die];
-
-                tracing::debug!(
-                    "Found DIE: name={:?}",
-                    functions[0].function_name(debug_info)
-                );
-
-                if find_inlined {
-                    tracing::debug!("Checking for inlined functions");
-
-                    let inlined_functions =
-                        self.find_inlined_functions(debug_info, address, current.offset())?;
-
-                    if inlined_functions.is_empty() {
-                        tracing::debug!("No inlined function found!");
-                    } else {
-                        tracing::debug!(
-                            "{} inlined functions for address {}",
-                            inlined_functions.len(),
-                            address
-                        );
-                    }
-
-                    functions.extend(inlined_functions.into_iter());
-                }
-                return Ok(functions);
-            }
+            functions.extend(inlined_functions.into_iter());
+            return Ok(functions);
         }
         Ok(vec![])
     }
 
     /// Check if the function located at the given offset contains inlined functions at the
     /// given address.
-    pub(crate) fn find_inlined_functions(
-        &self,
-        debug_info: &DebugInfo,
+    pub(crate) fn find_inlined_functions<'abbrev>(
+        &'abbrev self,
+        debug_info: &'abbrev DebugInfo,
         address: u64,
-        offset: UnitOffset,
-    ) -> Result<Vec<FunctionDie>, DebugError> {
+        parent_offset: UnitOffset,
+    ) -> Result<Vec<FunctionDie<'abbrev, '_>>, DebugError> {
         // If we don't have any entries at our unit offset, return an empty vector.
-        let Ok(mut cursor) = self.unit.entries_at_offset(offset) else {
+        // This cursor starts at, and includes the entries for the non-inlined function at 'parent_offset'.
+        let Ok(mut cursor) = self.unit.entries_at_offset(parent_offset) else {
             return Ok(vec![]);
         };
 
         let mut current_depth = 0;
+        // The abort depth is used to control navigation of `cursor.next_dfs()` tree that contains
+        // the inlined functions for the current address.  It is set to the current depth when a
+        // qualifying inlined function is found, and prevents the cursor from searching back up the
+        // tree, for sibling branches.
+        // This is a performance optimization only, and will not affect the correctness of the result.
         let mut abort_depth = 0;
         let mut functions = Vec::new();
 
         while let Ok(Some((depth, current))) = cursor.next_dfs() {
             current_depth += depth;
-            if current_depth < abort_depth {
-                break;
-            }
 
-            // Skip anything that is not an inlined subroutine.
-            if current.tag() != gimli::DW_TAG_inlined_subroutine {
+            if current.offset() == parent_offset {
+                // We only want children of the non-inlined function DIE at the given `parent_offset`.
                 continue;
             }
 
-            let mut ranges = debug_info.dwarf.die_ranges(&self.unit, current)?;
-
-            while let Ok(Some(range)) = ranges.next() {
-                if !range.contains(address) {
-                    continue;
-                }
-                // Check if we are actually in an inlined function
-
-                // We don't have to search further up in the tree, if there are multiple inlined functions,
-                // they will be children of the current function.
-                abort_depth = current_depth;
-
-                // Find the abstract definition
-                let Ok(Some(abstract_origin)) = current.attr(gimli::DW_AT_abstract_origin) else {
-                    tracing::warn!("No abstract origin for inlined function, skipping.");
-                    return Ok(vec![]);
-                };
-                let abstract_origin_value = abstract_origin.value();
-                let gimli::AttributeValue::UnitRef(unit_ref) = abstract_origin_value else {
-                    tracing::warn!(
-                        "Unsupported DW_AT_abstract_origin value: {:?}",
-                        abstract_origin_value
-                    );
-                    continue;
-                };
-
-                let Some(mut die) = self.unit.entry(unit_ref).ok().and_then(|abstract_die| {
-                    FunctionDie::new_inlined(current.clone(), abstract_die.clone(), self)
-                }) else {
-                    continue;
-                };
-
-                die.low_pc = range.begin;
-                die.high_pc = range.end;
-
-                functions.push(die);
+            if current_depth < abort_depth {
+                // We have found all the inlined functions for the current address
+                // so we can abort the search, before it starts searching other branches of the tree.
+                break;
             }
+
+            // Keep the current DIE only if it is an inlined function
+            let Some(die) = FunctionDie::new(current.clone(), self, debug_info, address)? else {
+                continue;
+            };
+
+            // Everytime we find a qualifying inlined-function, we set the abort depth
+            // to ensure the `cursor.next_dfs()` will be prevented from reversing the depth traversal to search for peers.
+            abort_depth = current_depth;
+
+            functions.push(die);
         }
 
         Ok(functions)
@@ -681,7 +644,7 @@ impl UnitInfo {
                         .get_program_counter()
                         .and_then(|reg| reg.value)
                     else {
-                        return Err(DebugError::UnwindIncompleteResults {
+                        return Err(DebugError::WarnAndContinue {
                             message:
                                 "Cannot unwind `Variable` without a valid PC (program_counter)"
                                     .to_string(),
@@ -814,18 +777,19 @@ impl UnitInfo {
     fn extract_array_range(
         &self,
         array_parent_node: UnitOffset,
-    ) -> Result<Option<std::ops::Range<u64>>, DebugError> {
+    ) -> Result<Vec<Range<u64>>, DebugError> {
         let mut tree = self.unit.entries_tree(Some(array_parent_node))?;
 
         let root = tree.root()?;
 
         let mut children = root.children();
 
+        let mut ranges = vec![];
         while let Some(child) = children.next()? {
             match child.entry().tag() {
                 gimli::DW_TAG_subrange_type => {
                     if let Some(range) = self.extract_array_range_attribute(child.entry())? {
-                        return Ok(Some(range));
+                        ranges.push(range);
                     }
                 }
                 other => tracing::debug!(
@@ -835,7 +799,7 @@ impl UnitInfo {
             }
         }
 
-        Ok(None)
+        Ok(ranges)
     }
 
     /// Extract the array range values
@@ -844,7 +808,7 @@ impl UnitInfo {
     fn extract_array_range_attribute(
         &self,
         entry: &gimli::DebuggingInformationEntry<GimliReader>,
-    ) -> Result<Option<std::ops::Range<u64>>, DebugError> {
+    ) -> Result<Option<Range<u64>>, DebugError> {
         let mut variable_attributes = entry.attrs();
 
         let mut lower_bound = None;
@@ -1167,7 +1131,7 @@ impl UnitInfo {
 
                 // First: extract sub range
                 match self.extract_array_range(node.offset()) {
-                    Ok(Some(subrange)) => {
+                    Ok(subranges) => {
                         match node.attr_value(gimli::DW_AT_type) {
                             Ok(Some(gimli::AttributeValue::UnitRef(unit_ref))) => {
                                 // The memory location of array members build on top of the memory location of the child_variable.
@@ -1179,47 +1143,30 @@ impl UnitInfo {
                                     memory,
                                     frame_info,
                                 )?;
-                                // Now we can explode the array members.
 
-                                if subrange.is_empty() {
-                                    // Gracefully handle the case where the array is empty.
-                                    // - Resolve a 'dummy' child, to determine the type of child_variable.
-                                    self.expand_array_member(
+                                // Now we can explode the array members.
+                                if let Ok(array_member_type_node) = self.unit.entry(unit_ref) {
+                                    // - Next, process this DW_TAG_array_type's DW_AT_type full tree.
+                                    // - We have to do this repeatedly, for every array member in the range.
+                                    // - We have to do this recursively because some compilers encode nested arrays as multiple subranges on the same node.
+                                    self.expand_array_members(
                                         debug_info,
-                                        unit_ref,
+                                        &array_member_type_node,
                                         cache,
                                         child_variable,
                                         memory,
-                                        subrange,
+                                        &subranges,
                                         0,
                                         frame_info,
                                     )?;
-                                    // - Delete the dummy child that was created above.
-                                    cache
-                                        .remove_cache_entry_children(child_variable.variable_key)?;
-                                } else {
-                                    // - Next, process this DW_TAG_array_type's DW_AT_type full tree.
-                                    // - We have to do this repeatedly, for every array member in the range.
-                                    for array_member_index in subrange.clone() {
-                                        self.expand_array_member(
-                                            debug_info,
-                                            unit_ref,
-                                            cache,
-                                            child_variable,
-                                            memory,
-                                            subrange.clone(),
-                                            array_member_index,
-                                            frame_info,
-                                        )?;
-                                    }
-                                }
+                                };
                             }
                             Ok(Some(other_attribute_value)) => {
                                 child_variable.set_value(VariableValue::Error(
-                                            format!(
-                                                "Unimplemented: Attribute Value for DW_AT_type {other_attribute_value:?}"
-                                            ),
-                                        ));
+                                    format!(
+                                        "Unimplemented: Attribute Value for DW_AT_type {other_attribute_value:?}"
+                                    ),
+                                ));
                             }
                             Ok(None) => {
                                 child_variable.set_value(self.language.process_tag_with_no_type(
@@ -1233,11 +1180,6 @@ impl UnitInfo {
                                 )));
                             }
                         }
-                    }
-                    Ok(None) => {
-                        child_variable.set_value(VariableValue::Error(
-                            "Unable to retrieve array range information".to_string(),
-                        ));
                     }
                     Err(error) => child_variable.set_value(VariableValue::Error(format!(
                         "Error: Failed to extract array range: {error:?}"
@@ -1385,63 +1327,90 @@ impl UnitInfo {
 
     /// Create child variable entries to represent array members and their values.
     #[allow(clippy::too_many_arguments)]
-    fn expand_array_member(
+    fn expand_array_members(
         &self,
         debug_info: &DebugInfo,
-        unit_ref: UnitOffset,
+        array_member_type_node: &DebuggingInformationEntry<GimliReader>,
         cache: &mut VariableCache,
-        child_variable: &mut Variable,
+        array_variable: &mut Variable,
         memory: &mut dyn MemoryInterface,
-        subrange_bounds: std::ops::Range<u64>,
-        array_member_index: u64,
+        subranges: &[Range<u64>],
+        level: usize,
         frame_info: StackFrameInfo<'_>,
     ) -> Result<(), DebugError> {
-        let Ok(array_member_type_node) = self.unit.entry(unit_ref) else {
-            return Ok(());
-        };
-        let mut array_member_variable =
-            cache.create_variable(child_variable.variable_key, Some(self))?;
-        array_member_variable.member_index = Some(array_member_index as i64);
-        // Override the calculated member name with a more 'array-like' name.
-        array_member_variable.name = VariableName::Named(format!("__{array_member_index}"));
-        array_member_variable.source_location = child_variable.source_location.clone();
-        self.process_memory_location(
-            debug_info,
-            &array_member_type_node,
-            child_variable,
-            &mut array_member_variable,
-            memory,
-            frame_info,
-        )?;
-        self.extract_type(
-            debug_info,
-            &array_member_type_node,
-            child_variable,
-            &mut array_member_variable,
-            memory,
-            cache,
-            frame_info,
-        )?;
-        if array_member_index == subrange_bounds.start {
-            // Once we know the type of the first member, we can set the array type.
-            child_variable.type_name = VariableType::Array {
-                count: subrange_bounds.end as usize,
-                item_type_name: Box::new(array_member_variable.type_name.clone()),
-            };
-            // Once we know the byte_size of the first member, we can set the array byte_size.
-            if let Some(array_member_byte_size) = array_member_variable.byte_size {
-                child_variable.byte_size =
-                    Some(array_member_byte_size * subrange_bounds.count() as u64);
+        let subrange = subranges[level].clone();
+        let item_count = subrange.clone().count();
+
+        // We need to process at least one element to get the array's type right.
+        let explode_range = if item_count == 0 { 0..1 } else { subrange };
+
+        for member_index in explode_range.clone() {
+            let mut array_member_variable =
+                cache.create_variable(array_variable.variable_key, Some(self))?;
+            array_member_variable.member_index = Some(member_index as i64);
+            // Override the calculated member name with a more 'array-like' name.
+            array_member_variable.name = VariableName::Named(format!("__{member_index}"));
+            array_member_variable.source_location = array_variable.source_location.clone();
+
+            // Set the byte size and push the element to its correct location.
+            // This call only sets size if:
+            //  - The parent array's size is known (after processing its first index)
+            //  - Or the member is a leaf member (i.e. not an array)
+            // The first index of the parent array will receive its binary size after processing
+            // its children.
+            self.process_memory_location(
+                debug_info,
+                array_member_type_node,
+                array_variable,
+                &mut array_member_variable,
+                memory,
+                frame_info,
+            )?;
+
+            if level < subranges.len() - 1 {
+                // Recursively process the nested array and place
+                // its items under the current variable.
+                self.expand_array_members(
+                    debug_info,
+                    array_member_type_node,
+                    cache,
+                    &mut array_member_variable,
+                    memory,
+                    subranges,
+                    level + 1,
+                    frame_info,
+                )?;
+            } else {
+                self.extract_type(
+                    debug_info,
+                    array_member_type_node,
+                    array_variable,
+                    &mut array_member_variable,
+                    memory,
+                    cache,
+                    frame_info,
+                )?;
             }
+
+            if member_index == explode_range.start {
+                array_variable.type_name = VariableType::Array {
+                    count: item_count,
+                    item_type_name: Box::new(array_member_variable.type_name.clone()),
+                };
+                if let Some(item_byte_size) = array_member_variable.byte_size {
+                    array_variable.byte_size = Some(item_byte_size * item_count as u64);
+                }
+            }
+
+            array_member_variable.extract_value(memory, cache);
+            cache.update_variable(&array_member_variable)?;
         }
-        self.handle_memory_location_special_cases(
-            unit_ref,
-            &mut array_member_variable,
-            child_variable,
-            memory,
-        );
-        array_member_variable.extract_value(memory, cache);
-        cache.update_variable(&array_member_variable)?;
+
+        // We want to remove the child entry if the array is empty. It was needed to process the
+        // array type, but it doesn't actually exist.
+        if item_count == 0 {
+            cache.remove_cache_entry_children(array_variable.variable_key)?;
+        }
 
         Ok(())
     }
@@ -1560,7 +1529,7 @@ impl UnitInfo {
             fn convert_incomplete(self) -> Result<ExpressionResult, DebugError> {
                 match self {
                     Ok(result) => Ok(result),
-                    Err(DebugError::UnwindIncompleteResults { message }) => {
+                    Err(DebugError::WarnAndContinue { message }) => {
                         tracing::warn!("UnwindIncompleteResults: {:?}", message);
                         Ok(ExpressionResult::Location(VariableLocation::Unavailable))
                     }
@@ -1582,7 +1551,7 @@ impl UnitInfo {
                     gimli::AttributeValue::Udata(offset_from_location) => {
                         let location = if let VariableLocation::Address(address) = parent_location {
                             let Some(location) = address.checked_add(offset_from_location) else {
-                                return Err(DebugError::UnwindIncompleteResults {
+                                return Err(DebugError::WarnAndContinue {
                                     message: "Overflow calculating variable address"
                                         .to_string(),
                                 });
@@ -1825,7 +1794,7 @@ impl UnitInfo {
                     provide_cfa(frame_info.canonical_frame_address, &mut evaluation)?
                 }
                 unimplemented_expression => {
-                    return Err(DebugError::UnwindIncompleteResults {
+                    return Err(DebugError::WarnAndContinue {
                         message: format!("Unimplemented: Expressions that include {unimplemented_expression:?} are not currently supported."
                     )});
                 }
@@ -1844,7 +1813,7 @@ impl UnitInfo {
         memory: &mut dyn MemoryInterface,
     ) {
         let location = if let Some(child_member_index) = child_variable.member_index {
-            // If this variable is a member of an array type, and needs special handling to calculate the `memory_location`.
+            // Push the array member to the proper location according to its index.
             if let VariableLocation::Address(address) = parent_variable.memory_location {
                 if let Some(byte_size) = child_variable.byte_size {
                     let Some(location) = address.checked_add(child_member_index as u64 * byte_size)
@@ -2126,13 +2095,13 @@ fn provide_register(
             let register_value = gimli::Value::Generic(raw_value.try_into()?);
             Ok(evaluation.resume_with_register(register_value)?)
         }
-        Some(_) => Err(DebugError::UnwindIncompleteResults {
+        Some(_) => Err(DebugError::WarnAndContinue {
             message: format!(
                 "Unimplemented: Support for type {:?} in `RequiresRegister`",
                 base_type
             ),
         }),
-        None => Err(DebugError::UnwindIncompleteResults {
+        None => Err(DebugError::WarnAndContinue {
             message: format!(
                 "Error while calculating `Variable::memory_location`. No value for register #:{}.",
                 register.0
@@ -2147,14 +2116,14 @@ fn provide_frame_base(
     evaluation: &mut gimli::Evaluation<EndianReader>,
 ) -> Result<EvaluationResult<EndianReader>, DebugError> {
     let Some(frame_base) = frame_base else {
-        return Err(DebugError::UnwindIncompleteResults {
+        return Err(DebugError::WarnAndContinue {
             message: "Cannot unwind `Variable` location without a valid frame base address.)"
                 .to_string(),
         });
     };
     match evaluation.resume_with_frame_base(frame_base) {
         Ok(evaluation_result) => Ok(evaluation_result),
-        Err(error) => Err(DebugError::UnwindIncompleteResults {
+        Err(error) => Err(DebugError::WarnAndContinue {
             message: format!("Error while calculating `Variable::memory_location`:{error}."),
         }),
     }
@@ -2166,14 +2135,14 @@ fn provide_cfa(
     evaluation: &mut gimli::Evaluation<EndianReader>,
 ) -> Result<EvaluationResult<EndianReader>, DebugError> {
     let Some(cfa) = cfa else {
-        return Err(DebugError::UnwindIncompleteResults {
+        return Err(DebugError::WarnAndContinue {
             message: "Cannot unwind `Variable` location without a valid canonical frame address.)"
                 .to_string(),
         });
     };
     match evaluation.resume_with_call_frame_cfa(cfa) {
         Ok(evaluation_result) => Ok(evaluation_result),
-        Err(error) => Err(DebugError::UnwindIncompleteResults {
+        Err(error) => Err(DebugError::WarnAndContinue {
             message: format!("Error while calculating `Variable::memory_location`:{error}."),
         }),
     }
@@ -2193,7 +2162,7 @@ fn read_memory(
     ) -> Result<[u8; SIZE], DebugError> {
         let mut buff = [0u8; SIZE];
         memory.read(address, &mut buff).map_err(|error| {
-            DebugError::UnwindIncompleteResults {
+            DebugError::WarnAndContinue {
                 message: format!("Unexpected error while reading debug expressions from target memory: {error:?}. Please report this as a bug.")
             }
         })?;
@@ -2214,7 +2183,7 @@ fn read_memory(
             gimli::Value::U32(u32::from_le_bytes(buff))
         }
         x => {
-            return Err(DebugError::UnwindIncompleteResults {
+            return Err(DebugError::WarnAndContinue {
                 message: format!(
                     "Unimplemented: Requested memory with size {x}, which is not supported yet."
                 ),
