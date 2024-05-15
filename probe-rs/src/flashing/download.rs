@@ -136,7 +136,7 @@ fn print_instr_sets(instr_sets: &[InstructionSet]) -> String {
 ///
 /// options.verify = true;
 /// ```
-#[derive(Default)]
+#[derive(Default, Clone)]
 #[non_exhaustive]
 pub struct DownloadOptions {
     /// An optional progress reporter which is used if this argument is set to `Some(...)`.
