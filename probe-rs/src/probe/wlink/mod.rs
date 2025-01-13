@@ -3,8 +3,7 @@
 //! The protocol is mostly undocumented, and is changing between firmware versions.
 //! For more details see: <https://github.com/ch32-rs/wlink>
 
-use crate::architecture::riscv::dtm::jtag_dtm::JtagDtm;
-use core::fmt;
+use std::fmt;
 use std::time::Duration;
 
 use nusb::DeviceInfo;
@@ -13,10 +12,12 @@ use probe_rs_target::ScanChainElement;
 use self::{commands::Speed, usb_interface::WchLinkUsbDevice};
 use super::JTAGAccess;
 use crate::{
-    architecture::riscv::communication_interface::{RiscvCommunicationInterface, RiscvError},
+    architecture::riscv::{
+        communication_interface::RiscvInterfaceBuilder, dtm::jtag_dtm::JtagDtmBuilder,
+    },
     probe::{
-        DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, JtagChainItem,
-        ProbeCreationError, ProbeFactory, WireProtocol,
+        DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, ProbeError, ProbeFactory,
+        WireProtocol,
     },
 };
 
@@ -224,7 +225,7 @@ impl WchLink {
         self.v_minor = probe_info.minor_version;
 
         if self.v_major != 0x02 && self.v_minor < 0x07 {
-            return Err(DebugProbeError::ProbeFirmwareOutdated);
+            return Err(WchLinkError::UnsupportedFirmwareVersion.into());
         }
 
         self.variant = probe_info.variant;
@@ -308,7 +309,7 @@ impl DebugProbe for WchLink {
 
         self.chip_family = resp.chip_family;
 
-        tracing::info!("attached riscvchip {:?}", self.chip_family);
+        tracing::info!("attached riscv chip {:?}", self.chip_family);
 
         self.chip_id = resp.chip_id;
 
@@ -366,14 +367,10 @@ impl DebugProbe for WchLink {
         true
     }
 
-    fn try_get_riscv_interface(
-        self: Box<Self>,
-    ) -> Result<RiscvCommunicationInterface, (Box<dyn DebugProbe>, RiscvError)> {
-        let jtag_dtm = match JtagDtm::new(self) {
-            Ok(jtag_dtm) => Box::new(jtag_dtm),
-            Err((access, err)) => return Err((access.into_probe(), err)),
-        };
-        RiscvCommunicationInterface::new(jtag_dtm).map_err(|(probe, err)| (probe.into_probe(), err))
+    fn try_get_riscv_interface_builder<'probe>(
+        &'probe mut self,
+    ) -> Result<Box<dyn RiscvInterfaceBuilder<'probe> + 'probe>, DebugProbeError> {
+        Ok(Box::new(JtagDtmBuilder::new(self)))
     }
 
     fn set_scan_chain(
@@ -382,12 +379,20 @@ impl DebugProbe for WchLink {
     ) -> Result<(), DebugProbeError> {
         Ok(())
     }
+
+    fn scan_chain(&self) -> Result<&[ScanChainElement], DebugProbeError> {
+        Ok(&[])
+    }
 }
 
 /// Wrap WCH-Link's USB based DMI access as a fake JTAGAccess
 impl JTAGAccess for WchLink {
-    fn scan_chain(&mut self) -> Result<Vec<JtagChainItem>, DebugProbeError> {
-        Ok(vec![])
+    fn scan_chain(&mut self) -> Result<(), DebugProbeError> {
+        Ok(())
+    }
+
+    fn tap_reset(&mut self) -> Result<(), DebugProbeError> {
+        Ok(())
     }
 
     fn read_register(&mut self, address: u32, len: u32) -> Result<Vec<u8>, DebugProbeError> {
@@ -433,9 +438,7 @@ impl JTAGAccess for WchLink {
                     self.dmi_op_write(0x10, 0x00000001)?;
                     // dmcontrol.dmactive is checked later
                 } else if val & DTMCS_DMIHARDRESET_MASK != 0 {
-                    return Err(DebugProbeError::ProbeSpecific(Box::new(
-                        WchLinkError::UnsupportedOperation,
-                    )));
+                    return Err(WchLinkError::UnsupportedOperation.into());
                 }
 
                 Ok(0x71_u32.to_le_bytes().to_vec())
@@ -501,6 +504,12 @@ impl JTAGAccess for WchLink {
             _ => unreachable!("unknown register address 0x{:08x}", address),
         }
     }
+
+    fn write_dr(&mut self, _data: &[u8], _len: u32) -> Result<Vec<u8>, DebugProbeError> {
+        Err(DebugProbeError::NotImplemented {
+            function_name: "write_dr",
+        })
+    }
 }
 
 fn get_wlink_info(device: &DeviceInfo) -> Option<DebugProbeInfo> {
@@ -533,39 +542,26 @@ fn list_wlink_devices() -> Vec<DebugProbeInfo> {
     probes
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, docsplay::Display)]
 pub(crate) enum WchLinkError {
-    #[error("Unknown WCH-Link device(new variant?)")]
+    /// Unknown WCH-Link device.
     UnknownDevice,
-    #[error("Firmware version is not supported.")]
+    /// Firmware version is not supported.
     UnsupportedFirmwareVersion,
-    #[error("Not enough bytes written.")]
+    /// Not enough bytes written.
     NotEnoughBytesWritten { is: usize, should: usize },
-    #[error("Not enough bytes read.")]
+    /// Not enough bytes read.
     NotEnoughBytesRead { is: usize, should: usize },
-    #[error("Usb endpoint not found.")]
+    /// Usb endpoint not found.
     EndpointNotFound,
-    #[error("Invalid payload.")]
+    /// Invalid payload.
     InvalidPayload,
-    #[error("Protocol error.")]
+    /// Protocol error.
     Protocol(u8, Vec<u8>),
-    #[error("Unknown chip 0x{0:02x}")]
+    /// Unknown chip {0:#04x}.
     UnknownChip(u8),
-    #[error("Unsupported operation.")]
+    /// Unsupported operation.
     UnsupportedOperation,
 }
 
-impl From<WchLinkError> for DebugProbeError {
-    fn from(e: WchLinkError) -> Self {
-        match e {
-            WchLinkError::UnsupportedFirmwareVersion => DebugProbeError::ProbeFirmwareOutdated,
-            _ => DebugProbeError::ProbeSpecific(Box::new(e)),
-        }
-    }
-}
-
-impl From<WchLinkError> for ProbeCreationError {
-    fn from(e: WchLinkError) -> Self {
-        ProbeCreationError::ProbeSpecific(Box::new(e))
-    }
-}
+impl ProbeError for WchLinkError {}

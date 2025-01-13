@@ -2,50 +2,47 @@
 
 use std::{
     collections::HashMap,
+    ops::Range,
     time::{Duration, Instant},
 };
 
+use probe_rs_target::MemoryRange;
+
 use crate::{
-    architecture::xtensa::arch::{
-        instruction::Instruction, CpuRegister, Register, SpecialRegister,
+    architecture::xtensa::{
+        arch::{instruction::Instruction, CpuRegister, Register, SpecialRegister},
+        xdm::{DebugStatus, XdmState},
     },
-    probe::{DebugProbeError, DeferredResultIndex, JTAGAccess, Probe},
+    probe::{DebugProbeError, DeferredResultIndex, JTAGAccess},
     BreakpointCause, Error as ProbeRsError, HaltReason, MemoryInterface,
 };
 
 use super::xdm::{Error as XdmError, Xdm};
 
 /// Possible Xtensa errors
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, docsplay::Display)]
 pub enum XtensaError {
-    /// An error originating from the DebugProbe
-    #[error("Debug Probe Error")]
+    /// An error originating from the DebugProbe occurred.
     DebugProbe(#[from] DebugProbeError),
-    /// Xtensa debug module error
-    #[error("Xtensa debug module error")]
-    XdmError(#[from] XdmError),
-    /// A timeout occurred
-    // TODO: maybe we could be a bit more specific
-    #[error("The operation has timed out")]
-    Timeout,
-    /// The connected target is not an Xtensa device.
-    #[error("Connected target is not an Xtensa device.")]
-    NoXtensaTarget,
-    /// The requested register is not available.
-    #[error("The requested register is not available.")]
-    RegisterNotAvailable,
-    /// The result index of a batched command is not available.
-    #[error("The requested data is not available due to a previous error.")]
-    BatchedResultNotAvailable,
-}
 
-impl From<XtensaError> for DebugProbeError {
-    fn from(e: XtensaError) -> DebugProbeError {
-        match e {
-            XtensaError::DebugProbe(err) => err,
-            other_error => DebugProbeError::Other(other_error.into()),
-        }
-    }
+    /// Xtensa debug module error.
+    XdmError(#[from] XdmError),
+
+    /// The core is not enabled.
+    CoreDisabled,
+
+    /// The operation has timed out.
+    // TODO: maybe we could be a bit more specific
+    Timeout,
+
+    /// The connected target is not an Xtensa device.
+    NoXtensaTarget,
+
+    /// The requested register is not available.
+    RegisterNotAvailable,
+
+    /// The result index of a batched command is not available.
+    BatchedResultNotAvailable,
 }
 
 impl From<XtensaError> for ProbeRsError {
@@ -59,7 +56,7 @@ impl From<XtensaError> for ProbeRsError {
 
 #[derive(Clone, Copy)]
 #[allow(unused)]
-pub(super) enum DebugLevel {
+enum DebugLevel {
     L2 = 2,
     L3 = 3,
     L4 = 4,
@@ -92,58 +89,102 @@ impl DebugLevel {
     }
 }
 
-struct XtensaCommunicationInterfaceState {
-    /// Pairs of (register, deferred value). The value is optional where None means "being restored"
+/// Xtensa interface state.
+// FIXME: This struct is a weird mix between core state, debug module state and core configuration.
+pub(super) struct XtensaInterfaceState {
+    /// Pairs of (register, read handle). The value is optional where None means "being restored"
     saved_registers: HashMap<Register, Option<DeferredResultIndex>>,
 
+    /// Whether the core is halted.
+    // This roughly relates to Core Debug States (true = Running, false = [Stopped, Stepping])
     is_halted: bool,
-}
 
-/// An interface that implements controls for Xtensa cores.
-pub struct XtensaCommunicationInterface {
-    /// The Xtensa debug module
-    pub(super) xdm: Xdm,
-    state: XtensaCommunicationInterfaceState,
-
+    /// The number of hardware breakpoints the target supports. CPU-specific configuration value.
     hw_breakpoint_num: u32,
+
+    /// The interrupt level at which debug exceptions are generated. CPU-specific configuration value.
     debug_level: DebugLevel,
+
+    /// The address range for which we should not use LDDR32.P/SDDR32.P instructions.
+    slow_memory_access_ranges: Vec<Range<u64>>,
 }
 
-impl XtensaCommunicationInterface {
-    /// Create the Xtensa communication interface using the underlying probe driver
-    pub fn new(probe: Box<dyn JTAGAccess>) -> Result<Self, (Box<dyn JTAGAccess>, DebugProbeError)> {
-        let xdm = Xdm::new(probe).map_err(|(probe, e)| (probe, e.into()))?;
+impl Default for XtensaInterfaceState {
+    fn default() -> Self {
+        Self {
+            saved_registers: Default::default(),
+            is_halted: false,
 
-        let mut s = Self {
-            xdm,
-            state: XtensaCommunicationInterfaceState {
-                saved_registers: Default::default(),
-                is_halted: false,
-            },
-            // TODO chip-specific configuration
+            // FIXME: these are per-chip configuration parameters
             hw_breakpoint_num: 2,
             debug_level: DebugLevel::L6,
-        };
+            slow_memory_access_ranges: vec![],
+        }
+    }
+}
 
-        match s.init() {
-            Ok(()) => Ok(s),
+/// Debug module and transport state.
+#[derive(Default)]
+pub struct XtensaDebugInterfaceState {
+    interface_state: XtensaInterfaceState,
+    xdm_state: XdmState,
+}
 
-            Err(e) => Err((s.xdm.free(), e.into())),
+/// The higher level of the XDM functionality.
+// TODO: this includes core state and CPU configuration that don't exactly belong
+// here but one layer up.
+pub struct XtensaCommunicationInterface<'probe> {
+    /// The Xtensa debug module
+    pub(crate) xdm: Xdm<'probe>,
+    state: &'probe mut XtensaInterfaceState,
+}
+
+impl<'probe> XtensaCommunicationInterface<'probe> {
+    /// Create the Xtensa communication interface using the underlying probe driver
+    pub fn new(
+        probe: &'probe mut dyn JTAGAccess,
+        state: &'probe mut XtensaDebugInterfaceState,
+    ) -> Self {
+        let XtensaDebugInterfaceState {
+            interface_state,
+            xdm_state,
+        } = state;
+        let xdm = Xdm::new(probe, xdm_state);
+
+        Self {
+            xdm,
+            state: interface_state,
         }
     }
 
-    /// Destruct the interface and return the stored probe driver.
-    pub fn close(self) -> Probe {
-        Probe::from_attached_probe(self.xdm.probe.into_probe())
+    /// Set the range of addresses for which we should not use LDDR32.P/SDDR32.P instructions.
+    pub fn add_slow_memory_access_range(&mut self, range: Range<u64>) {
+        self.state.slow_memory_access_ranges.push(range);
     }
 
     /// Read the targets IDCODE.
-    pub fn read_idcode(&mut self) -> Result<u32, DebugProbeError> {
-        Ok(self.xdm.read_idcode()?)
+    pub fn read_idcode(&mut self) -> Result<u32, XtensaError> {
+        self.xdm.read_idcode()
     }
 
-    fn init(&mut self) -> Result<(), XtensaError> {
-        // TODO any initialization that needs to be done
+    /// Enter debug mode.
+    pub fn enter_debug_mode(&mut self) -> Result<(), XtensaError> {
+        self.xdm.enter_debug_mode()?;
+
+        self.state.is_halted = self.xdm.status()?.stopped();
+
+        Ok(())
+    }
+
+    pub(crate) fn leave_debug_mode(&mut self) -> Result<(), XtensaError> {
+        if self.xdm.status()?.stopped() {
+            self.restore_registers()?;
+            self.resume_core()?;
+        }
+        self.xdm.leave_ocd_mode()?;
+
+        tracing::debug!("Left OCD mode");
+
         Ok(())
     }
 
@@ -151,75 +192,13 @@ impl XtensaCommunicationInterface {
     ///
     /// On the Xtensa architecture this is the `NIBREAK` configuration parameter.
     pub fn available_breakpoint_units(&self) -> u32 {
-        self.hw_breakpoint_num
-    }
-
-    /// Enters OCD mode and halts the core.
-    pub fn enter_ocd_mode(&mut self) -> Result<(), XtensaError> {
-        self.xdm.halt()?;
-        tracing::info!("Entered OCD mode");
-        Ok(())
-    }
-
-    /// Returns whether the core is in OCD mode.
-    pub fn is_in_ocd_mode(&mut self) -> Result<bool, XtensaError> {
-        self.xdm.is_in_ocd_mode()
-    }
-
-    /// Leaves OCD mode, restores state and resumes program execution.
-    pub fn leave_ocd_mode(&mut self) -> Result<(), XtensaError> {
-        self.restore_registers()?;
-        self.resume()?;
-        self.xdm.leave_ocd_mode()?;
-        tracing::info!("Left OCD mode");
-        Ok(())
-    }
-
-    /// Resets the processor core.
-    pub fn reset(&mut self) -> Result<(), XtensaError> {
-        match self.reset_and_halt(Duration::from_millis(500)) {
-            Ok(_) => {
-                self.resume()?;
-
-                Ok(())
-            }
-            Err(error) => Err(XtensaError::DebugProbe(DebugProbeError::Other(
-                anyhow::anyhow!("Error during reset").context(error),
-            ))),
-        }
-    }
-
-    /// Resets the processor core and halts it immediately.
-    pub fn reset_and_halt(&mut self, timeout: Duration) -> Result<(), XtensaError> {
-        self.xdm.target_reset_assert()?;
-        self.xdm.halt_on_reset(true);
-        self.xdm.target_reset_deassert()?;
-        self.wait_for_core_halted(timeout)?;
-        self.xdm.halt_on_reset(false);
-
-        // TODO: this is only necessary to run code, so this might not be the best place
-        // Make sure the CPU is in a known state and is able to run code we download.
-        self.write_register({
-            let mut ps = ProgramStatus(0);
-            ps.set_intlevel(1);
-            ps.set_user_mode(true);
-            ps.set_woe(true);
-            ps
-        })?;
-
-        Ok(())
-    }
-
-    /// Halts the core.
-    pub fn halt(&mut self) -> Result<(), XtensaError> {
-        tracing::debug!("Halting core");
-        self.xdm.halt()
+        self.state.hw_breakpoint_num
     }
 
     /// Returns whether the core is halted.
-    pub fn is_halted(&mut self) -> Result<bool, XtensaError> {
+    pub fn core_halted(&mut self) -> Result<bool, XtensaError> {
         if !self.state.is_halted {
-            self.state.is_halted = self.xdm.is_halted()?;
+            self.state.is_halted = self.xdm.status()?.stopped();
         }
 
         Ok(self.state.is_halted)
@@ -229,44 +208,119 @@ impl XtensaCommunicationInterface {
     ///
     /// This function lowers the interrupt level to allow halting on debug exceptions.
     pub fn wait_for_core_halted(&mut self, timeout: Duration) -> Result<(), XtensaError> {
-        let now = Instant::now();
-        while !self.is_halted()? {
-            if now.elapsed() > timeout {
-                tracing::warn!("Timeout waiting for core to halt");
+        // Wait until halted state is active again.
+        let start = Instant::now();
+
+        while !self.core_halted()? {
+            if start.elapsed() >= timeout {
                 return Err(XtensaError::Timeout);
             }
-
+            // Wait a bit before polling again.
             std::thread::sleep(Duration::from_millis(1));
         }
-        tracing::debug!("Core halted");
-
-        // Force a low INTLEVEL to allow halting on debug exceptions
-        // TODO: do this only if we set a breakpoint or watchpoint or single step
-        let mut ps = self.read_register::<ProgramStatus>()?;
-        ps.set_intlevel(1);
-        self.schedule_write_register(ps)?;
 
         Ok(())
     }
 
+    /// Halts the core.
+    pub(crate) fn halt(&mut self, timeout: Duration) -> Result<(), XtensaError> {
+        self.xdm.schedule_halt();
+        self.wait_for_core_halted(timeout)?;
+        Ok(())
+    }
+
+    /// Halts the core and returns `true` if the core was running before the halt.
+    pub(crate) fn halt_with_previous(&mut self, timeout: Duration) -> Result<bool, XtensaError> {
+        let was_running = if self.state.is_halted {
+            // Core is already halted, we don't need to do anything.
+            false
+        } else {
+            // If we have not halted the core, it may still be halted on a breakpoint, for example.
+            // Let's check status.
+            let status_idx = self.xdm.schedule_read_nexus_register::<DebugStatus>();
+            self.halt(timeout)?;
+            let before_status = DebugStatus(self.xdm.read_deferred_result(status_idx)?.into_u32());
+
+            !before_status.stopped()
+        };
+
+        Ok(was_running)
+    }
+
+    fn fast_halted_access(
+        &mut self,
+        mut op: impl FnMut(&mut Self) -> Result<(), XtensaError>,
+    ) -> Result<(), XtensaError> {
+        if self.state.is_halted {
+            // Core is already halted, we don't need to do anything.
+            return op(self);
+        }
+
+        // If we have not halted the core, it may still be halted on a breakpoint, for example.
+        // Let's check status.
+        let status_idx = self.xdm.schedule_read_nexus_register::<DebugStatus>();
+
+        // Queue up halting.
+        self.xdm.schedule_halt();
+
+        // We will need to check if we managed to halt the core.
+        let is_halted_idx = self.xdm.schedule_read_nexus_register::<DebugStatus>();
+        self.state.is_halted = true;
+
+        // Execute the operation while the core is presumed halted. If it is not, we will have
+        // various errors, but we will retry the operation.
+        let result = op(self);
+
+        // If the core was running, resume it.
+        let before_status = DebugStatus(self.xdm.read_deferred_result(status_idx)?.into_u32());
+        if !before_status.stopped() {
+            self.resume_core()?;
+        }
+
+        // If we did not manage to halt the core at once, let's retry using the slow path.
+        let after_status = DebugStatus(self.xdm.read_deferred_result(is_halted_idx)?.into_u32());
+
+        if after_status.stopped() {
+            return result;
+        }
+        self.state.is_halted = false;
+        self.halted_access(|this| op(this))
+    }
+
+    /// Executes a closure while ensuring the core is halted.
+    pub fn halted_access<R>(
+        &mut self,
+        op: impl FnOnce(&mut Self) -> Result<R, XtensaError>,
+    ) -> Result<R, XtensaError> {
+        let was_running = self.halt_with_previous(Duration::from_millis(100))?;
+
+        let result = op(self);
+
+        if was_running {
+            self.resume_core()?;
+        }
+
+        result
+    }
+
     /// Steps the core by one instruction.
     pub fn step(&mut self) -> Result<(), XtensaError> {
-        self.schedule_write_register(ICountLevel(self.debug_level as u32))?;
+        self.schedule_write_register(ICountLevel(self.state.debug_level as u32))?;
 
         // An exception is generated at the beginning of an instruction that would overflow ICOUNT.
         self.schedule_write_register(ICount(-2_i32 as u32))?;
 
-        self.resume()?;
+        self.resume_core()?;
         self.wait_for_core_halted(Duration::from_millis(100))?;
 
         // Avoid stopping again
-        self.schedule_write_register(ICountLevel(self.debug_level as u32 + 1))?;
+        self.schedule_write_register(ICountLevel(self.state.debug_level as u32 + 1))?;
 
         Ok(())
     }
 
     /// Resumes program execution.
-    pub fn resume(&mut self) -> Result<(), XtensaError> {
+    pub fn resume_core(&mut self) -> Result<(), XtensaError> {
         tracing::debug!("Resuming core");
         self.state.is_halted = false;
         self.xdm.resume()?;
@@ -371,8 +425,8 @@ impl XtensaCommunicationInterface {
         match register.into() {
             Register::Cpu(register) => Ok(self.schedule_read_cpu_register(register)),
             Register::Special(register) => self.schedule_read_special_register(register),
-            Register::CurrentPc => self.schedule_read_special_register(self.debug_level.pc()),
-            Register::CurrentPs => self.schedule_read_special_register(self.debug_level.ps()),
+            Register::CurrentPc => self.schedule_read_special_register(self.state.debug_level.pc()),
+            Register::CurrentPs => self.schedule_read_special_register(self.state.debug_level.ps()),
         }
     }
 
@@ -395,10 +449,10 @@ impl XtensaCommunicationInterface {
             Register::Cpu(register) => self.schedule_write_cpu_register(register, value),
             Register::Special(register) => self.schedule_write_special_register(register, value),
             Register::CurrentPc => {
-                self.schedule_write_special_register(self.debug_level.pc(), value)
+                self.schedule_write_special_register(self.state.debug_level.pc(), value)
             }
             Register::CurrentPs => {
-                self.schedule_write_special_register(self.debug_level.ps(), value)
+                self.schedule_write_special_register(self.state.debug_level.ps(), value)
             }
         }
     }
@@ -420,7 +474,7 @@ impl XtensaCommunicationInterface {
     ) -> Result<Option<Register>, XtensaError> {
         let register = register.into();
 
-        tracing::Span::current().record("register", &format!("{register:?}"));
+        tracing::Span::current().record("register", format!("{register:?}"));
 
         if matches!(
             register,
@@ -458,14 +512,14 @@ impl XtensaCommunicationInterface {
             let reader = value.unwrap();
             let value = self.xdm.read_deferred_result(reader)?.into_u32();
 
-            self.write_register_untyped(key, value)?;
+            self.schedule_write_register_untyped(key, value)?;
         }
 
         Ok(())
     }
 
     #[tracing::instrument(skip(self))]
-    fn restore_registers(&mut self) -> Result<(), XtensaError> {
+    pub(super) fn restore_registers(&mut self) -> Result<(), XtensaError> {
         tracing::debug!("Restoring registers");
 
         // Clone the list of saved registers so we can iterate over it, but code may still save
@@ -531,28 +585,48 @@ impl XtensaCommunicationInterface {
         }
 
         self.state.saved_registers.clear();
-        self.xdm.execute()
+        Ok(())
     }
 
-    fn read_memory(&mut self, address: u64, mut dst: &mut [u8]) -> Result<(), XtensaError> {
+    fn memory_access_for(&self, address: u64, len: usize) -> Box<dyn MemoryAccess> {
+        let use_slow_access = self
+            .state
+            .slow_memory_access_ranges
+            .iter()
+            .any(|r| r.intersects_range(&(address..address + len as u64)));
+
+        if use_slow_access {
+            Box::new(SlowMemoryAccess::new())
+        } else {
+            Box::new(FastMemoryAccess::new())
+        }
+    }
+
+    fn read_memory(&mut self, address: u64, dst: &mut [u8]) -> Result<(), XtensaError> {
         tracing::debug!("Reading {} bytes from address {:08x}", dst.len(), address);
         if dst.is_empty() {
             return Ok(());
         }
 
-        let was_halted = self.is_halted()?;
-        if !was_halted {
-            self.xdm.schedule_halt();
-            self.wait_for_core_halted(Duration::from_millis(100))?;
-        }
+        let mut memory_access = self.memory_access_for(address, dst.len());
 
-        // Write aligned address to the scratch register
-        let key = self.save_register(CpuRegister::A3)?;
-        self.schedule_write_cpu_register(CpuRegister::A3, address as u32 & !0x3)?;
+        let result = self.fast_halted_access(|this| {
+            memory_access.save_scratch_registers(this)?;
+            let result = this.read_memory_impl(memory_access.as_mut(), address, dst);
+            memory_access.restore_scratch_registers(this)?;
+            result
+        });
 
-        // Read from address in the scratch register
-        self.xdm
-            .schedule_execute_instruction(Instruction::Lddr32P(CpuRegister::A3));
+        result
+    }
+
+    fn read_memory_impl(
+        &mut self,
+        memory_access: &mut dyn MemoryAccess,
+        address: u64,
+        mut dst: &mut [u8],
+    ) -> Result<(), XtensaError> {
+        memory_access.load_initial_address_for_read(self, address as u32 & !0x3)?;
 
         let mut to_read = dst.len();
 
@@ -562,9 +636,9 @@ impl XtensaCommunicationInterface {
 
             // Avoid executing another read if we only have to read a single word
             let first_read = if offset + to_read <= 4 {
-                self.xdm.schedule_read_ddr()
+                memory_access.read_one(self)?
             } else {
-                self.xdm.schedule_read_ddr_and_execute()
+                memory_access.read_one_and_continue(self)?
             };
 
             let bytes_to_copy = (4 - offset).min(to_read);
@@ -578,17 +652,15 @@ impl XtensaCommunicationInterface {
 
         let mut aligned_reads = vec![];
         if to_read > 0 {
-            let words = if to_read % 4 == 0 {
-                to_read / 4
-            } else {
-                to_read / 4 + 1
-            };
+            let words = to_read.div_ceil(4);
 
             for _ in 0..words - 1 {
-                aligned_reads.push(self.xdm.schedule_read_ddr_and_execute());
+                aligned_reads.push(memory_access.read_one_and_continue(self)?);
             }
-            aligned_reads.push(self.xdm.schedule_read_ddr());
+            aligned_reads.push(memory_access.read_one(self)?);
         };
+
+        memory_access.restore_scratch_registers(self)?;
 
         if let Some((read, offset, bytes_to_copy)) = first_read {
             let word = self
@@ -614,21 +686,36 @@ impl XtensaCommunicationInterface {
             dst = &mut dst[bytes..];
         }
 
-        self.restore_register(key)?;
-
-        if !was_halted {
-            self.resume()?;
-        }
-
         Ok(())
     }
 
-    fn write_memory_unaligned8(&mut self, address: u32, data: &[u8]) -> Result<(), XtensaError> {
+    pub(crate) fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<(), XtensaError> {
+        tracing::debug!("Writing {} bytes to address {:08x}", data.len(), address);
         if data.is_empty() {
             return Ok(());
         }
 
-        let key = self.save_register(CpuRegister::A3)?;
+        let mut memory_access = self.memory_access_for(address, data.len());
+
+        let result = self.fast_halted_access(|this| {
+            memory_access.save_scratch_registers(this)?;
+            let result = this.write_memory_impl(memory_access.as_mut(), address, data);
+            memory_access.restore_scratch_registers(this)?;
+            result
+        });
+
+        result
+    }
+
+    fn write_memory_unaligned8(
+        &mut self,
+        memory_access: &mut dyn MemoryAccess,
+        address: u32,
+        data: &[u8],
+    ) -> Result<(), XtensaError> {
+        if data.is_empty() {
+            return Ok(());
+        }
 
         let offset = address as usize % 4;
         let aligned_address = address & !0x3;
@@ -644,7 +731,7 @@ impl XtensaCommunicationInterface {
         } else {
             // Read the aligned word
             let mut word = [0; 4];
-            self.read_memory(aligned_address as u64, &mut word)?;
+            self.read_memory_impl(memory_access, aligned_address as u64, &mut word)?;
 
             // Replace the written bytes. This will also panic if the input is crossing a word boundary
             word[offset..][..data.len()].copy_from_slice(data);
@@ -653,80 +740,75 @@ impl XtensaCommunicationInterface {
         };
 
         // Write the word back
-        self.schedule_write_register_untyped(CpuRegister::A3, aligned_address)?;
-        self.xdm.schedule_write_ddr(u32::from_le_bytes(data));
-        self.xdm
-            .schedule_execute_instruction(Instruction::Sddr32P(CpuRegister::A3));
-        self.restore_register(key)?;
-
-        self.xdm.execute()
+        memory_access.load_initial_address_for_write(self, aligned_address)?;
+        memory_access.write_one(self, u32::from_le_bytes(data))
     }
 
-    fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<(), XtensaError> {
-        tracing::debug!("Writing {} bytes to address {:08x}", data.len(), address);
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        let was_halted = self.is_halted()?;
-        if !was_halted {
-            self.xdm.schedule_halt();
-            self.wait_for_core_halted(Duration::from_millis(100))?;
-        }
-
-        let key = self.save_register(CpuRegister::A3)?;
-
-        let address = address as u32;
-
-        let mut addr = address;
-        let mut buffer = data;
+    fn write_memory_impl(
+        &mut self,
+        memory_access: &mut dyn MemoryAccess,
+        address: u64,
+        mut buffer: &[u8],
+    ) -> Result<(), XtensaError> {
+        let mut addr = address as u32;
 
         // We store the unaligned head of the data separately
         if addr % 4 != 0 {
             let unaligned_bytes = (4 - (addr % 4) as usize).min(buffer.len());
 
-            self.write_memory_unaligned8(addr, &buffer[..unaligned_bytes])?;
+            self.write_memory_unaligned8(memory_access, addr, &buffer[..unaligned_bytes])?;
 
             buffer = &buffer[unaligned_bytes..];
             addr += unaligned_bytes as u32;
         }
 
         if buffer.len() > 4 {
-            // Prepare store instruction
-            self.schedule_write_register_untyped(CpuRegister::A3, addr)?;
+            memory_access.load_initial_address_for_write(self, addr)?;
 
-            self.xdm
-                .schedule_write_instruction(Instruction::Sddr32P(CpuRegister::A3));
-
-            while buffer.len() > 4 {
+            let mut chunks = buffer.chunks_exact(4);
+            for chunk in chunks.by_ref() {
                 let mut word = [0; 4];
-                word[..].copy_from_slice(&buffer[..4]);
+                word[..].copy_from_slice(chunk);
                 let word = u32::from_le_bytes(word);
 
-                // Write data to DDR and store
-                self.xdm.schedule_write_ddr_and_execute(word);
+                memory_access.write_one(self, word)?;
 
-                buffer = &buffer[4..];
                 addr += 4;
             }
+
+            buffer = chunks.remainder();
         }
 
         // We store the narrow tail of the data separately
         if !buffer.is_empty() {
-            self.write_memory_unaligned8(addr, buffer)?;
-        }
-
-        self.restore_register(key)?;
-
-        self.xdm.execute()?;
-
-        if !was_halted {
-            self.resume()?;
+            self.write_memory_unaligned8(memory_access, addr, buffer)?;
         }
 
         // TODO: implement cache flushing on CPUs that need it.
 
         Ok(())
+    }
+
+    pub(crate) fn reset_and_halt(&mut self, timeout: Duration) -> Result<(), XtensaError> {
+        self.clear_register_cache();
+        self.xdm.reset_and_halt()?;
+        self.wait_for_core_halted(timeout)?;
+
+        // TODO: this is only necessary to run code, so this might not be the best place
+        // Make sure the CPU is in a known state and is able to run code we download.
+        self.write_register({
+            let mut ps = ProgramStatus(0);
+            ps.set_intlevel(0);
+            ps.set_user_mode(true);
+            ps.set_woe(true);
+            ps
+        })?;
+
+        Ok(())
+    }
+
+    pub(crate) fn clear_register_cache(&mut self) {
+        self.state.saved_registers.clear();
     }
 }
 
@@ -750,7 +832,7 @@ fn as_bytes_mut<T: DataType>(data: &mut [T]) -> &mut [u8] {
     }
 }
 
-impl MemoryInterface for XtensaCommunicationInterface {
+impl MemoryInterface for XtensaCommunicationInterface<'_> {
     fn read(&mut self, address: u64, dst: &mut [u8]) -> Result<(), crate::Error> {
         self.read_memory(address, dst)?;
 
@@ -761,7 +843,7 @@ impl MemoryInterface for XtensaCommunicationInterface {
         false
     }
 
-    fn read_word_64(&mut self, address: u64) -> anyhow::Result<u64, crate::Error> {
+    fn read_word_64(&mut self, address: u64) -> Result<u64, crate::Error> {
         let mut out = [0; 8];
         self.read(address, &mut out)?;
 
@@ -782,25 +864,25 @@ impl MemoryInterface for XtensaCommunicationInterface {
         Ok(u16::from_le_bytes(out))
     }
 
-    fn read_word_8(&mut self, address: u64) -> anyhow::Result<u8, crate::Error> {
+    fn read_word_8(&mut self, address: u64) -> Result<u8, crate::Error> {
         let mut out = 0;
         self.read(address, std::slice::from_mut(&mut out))?;
         Ok(out)
     }
 
-    fn read_64(&mut self, address: u64, data: &mut [u64]) -> anyhow::Result<(), crate::Error> {
+    fn read_64(&mut self, address: u64, data: &mut [u64]) -> Result<(), crate::Error> {
         self.read_8(address, as_bytes_mut(data))
     }
 
-    fn read_32(&mut self, address: u64, data: &mut [u32]) -> anyhow::Result<(), crate::Error> {
+    fn read_32(&mut self, address: u64, data: &mut [u32]) -> Result<(), crate::Error> {
         self.read_8(address, as_bytes_mut(data))
     }
 
-    fn read_16(&mut self, address: u64, data: &mut [u16]) -> anyhow::Result<(), crate::Error> {
+    fn read_16(&mut self, address: u64, data: &mut [u16]) -> Result<(), crate::Error> {
         self.read_8(address, as_bytes_mut(data))
     }
 
-    fn read_8(&mut self, address: u64, data: &mut [u8]) -> anyhow::Result<(), crate::Error> {
+    fn read_8(&mut self, address: u64, data: &mut [u8]) -> Result<(), crate::Error> {
         self.read(address, data)
     }
 
@@ -810,43 +892,43 @@ impl MemoryInterface for XtensaCommunicationInterface {
         Ok(())
     }
 
-    fn write_word_64(&mut self, address: u64, data: u64) -> anyhow::Result<(), crate::Error> {
+    fn write_word_64(&mut self, address: u64, data: u64) -> Result<(), crate::Error> {
         self.write(address, &data.to_le_bytes())
     }
 
-    fn write_word_32(&mut self, address: u64, data: u32) -> anyhow::Result<(), crate::Error> {
+    fn write_word_32(&mut self, address: u64, data: u32) -> Result<(), crate::Error> {
         self.write(address, &data.to_le_bytes())
     }
 
-    fn write_word_16(&mut self, address: u64, data: u16) -> anyhow::Result<(), crate::Error> {
+    fn write_word_16(&mut self, address: u64, data: u16) -> Result<(), crate::Error> {
         self.write(address, &data.to_le_bytes())
     }
 
-    fn write_word_8(&mut self, address: u64, data: u8) -> anyhow::Result<(), crate::Error> {
+    fn write_word_8(&mut self, address: u64, data: u8) -> Result<(), crate::Error> {
         self.write(address, &[data])
     }
 
-    fn write_64(&mut self, address: u64, data: &[u64]) -> anyhow::Result<(), crate::Error> {
+    fn write_64(&mut self, address: u64, data: &[u64]) -> Result<(), crate::Error> {
         self.write_8(address, as_bytes(data))
     }
 
-    fn write_32(&mut self, address: u64, data: &[u32]) -> anyhow::Result<(), crate::Error> {
+    fn write_32(&mut self, address: u64, data: &[u32]) -> Result<(), crate::Error> {
         self.write_8(address, as_bytes(data))
     }
 
-    fn write_16(&mut self, address: u64, data: &[u16]) -> anyhow::Result<(), crate::Error> {
+    fn write_16(&mut self, address: u64, data: &[u16]) -> Result<(), crate::Error> {
         self.write_8(address, as_bytes(data))
     }
 
-    fn write_8(&mut self, address: u64, data: &[u8]) -> anyhow::Result<(), crate::Error> {
+    fn write_8(&mut self, address: u64, data: &[u8]) -> Result<(), crate::Error> {
         self.write(address, data)
     }
 
-    fn supports_8bit_transfers(&self) -> anyhow::Result<bool, crate::Error> {
+    fn supports_8bit_transfers(&self) -> Result<bool, crate::Error> {
         Ok(true)
     }
 
-    fn flush(&mut self) -> anyhow::Result<(), crate::Error> {
+    fn flush(&mut self) -> Result<(), crate::Error> {
         Ok(())
     }
 }
@@ -1005,3 +1087,222 @@ u32_register!(ICount, SpecialRegister::ICount);
 #[derive(Copy, Clone, Debug)]
 pub struct ICountLevel(pub u32);
 u32_register!(ICountLevel, SpecialRegister::ICountLevel);
+
+/// The Program Counter register.
+#[derive(Copy, Clone, Debug)]
+pub struct ProgramCounter(pub u32);
+u32_register!(ProgramCounter, Register::CurrentPc);
+
+trait MemoryAccess {
+    fn save_scratch_registers(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<(), XtensaError>;
+
+    fn restore_scratch_registers(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<(), XtensaError>;
+
+    fn load_initial_address_for_read(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+        address: u32,
+    ) -> Result<(), XtensaError>;
+    fn load_initial_address_for_write(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+        address: u32,
+    ) -> Result<(), XtensaError>;
+
+    fn read_one(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<DeferredResultIndex, XtensaError>;
+
+    fn read_one_and_continue(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<DeferredResultIndex, XtensaError>;
+
+    fn write_one(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+        data: u32,
+    ) -> Result<(), XtensaError>;
+}
+
+/// Memory access using LDDR32.P and SDDR32.P instructions.
+struct FastMemoryAccess {
+    a3: Option<Register>,
+}
+impl FastMemoryAccess {
+    fn new() -> Self {
+        Self { a3: None }
+    }
+}
+impl MemoryAccess for FastMemoryAccess {
+    fn save_scratch_registers(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<(), XtensaError> {
+        self.a3 = interface.save_register(CpuRegister::A3)?;
+        Ok(())
+    }
+
+    fn restore_scratch_registers(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<(), XtensaError> {
+        interface.restore_register(self.a3.take())
+    }
+
+    fn load_initial_address_for_read(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+        address: u32,
+    ) -> Result<(), XtensaError> {
+        // Write aligned address to the scratch register
+        interface.schedule_write_cpu_register(CpuRegister::A3, address)?;
+
+        // Read from address in the scratch register
+        interface
+            .xdm
+            .schedule_execute_instruction(Instruction::Lddr32P(CpuRegister::A3));
+
+        Ok(())
+    }
+
+    fn load_initial_address_for_write(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+        address: u32,
+    ) -> Result<(), XtensaError> {
+        interface.schedule_write_cpu_register(CpuRegister::A3, address)?;
+        interface
+            .xdm
+            .schedule_write_instruction(Instruction::Sddr32P(CpuRegister::A3));
+
+        Ok(())
+    }
+
+    fn write_one(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+        data: u32,
+    ) -> Result<(), XtensaError> {
+        interface.xdm.schedule_write_ddr_and_execute(data);
+        Ok(())
+    }
+
+    fn read_one(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<DeferredResultIndex, XtensaError> {
+        Ok(interface.xdm.schedule_read_ddr())
+    }
+
+    fn read_one_and_continue(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<DeferredResultIndex, XtensaError> {
+        Ok(interface.xdm.schedule_read_ddr_and_execute())
+    }
+}
+
+/// Memory access without LDDR32.P and SDDR32.P instructions.
+struct SlowMemoryAccess {
+    a3: Option<Register>,
+    a4: Option<Register>,
+    current_address: u32,
+}
+impl SlowMemoryAccess {
+    fn new() -> Self {
+        Self {
+            a3: None,
+            a4: None,
+            current_address: 0,
+        }
+    }
+}
+
+impl MemoryAccess for SlowMemoryAccess {
+    fn save_scratch_registers(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<(), XtensaError> {
+        self.a3 = interface.save_register(CpuRegister::A3)?;
+        self.a4 = interface.save_register(CpuRegister::A4)?;
+        Ok(())
+    }
+
+    fn restore_scratch_registers(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<(), XtensaError> {
+        interface.restore_register(self.a4.take())?;
+        interface.restore_register(self.a3.take())?;
+        Ok(())
+    }
+
+    fn load_initial_address_for_read(
+        &mut self,
+        _interface: &mut XtensaCommunicationInterface,
+        address: u32,
+    ) -> Result<(), XtensaError> {
+        self.current_address = address;
+
+        Ok(())
+    }
+
+    fn load_initial_address_for_write(
+        &mut self,
+        _interface: &mut XtensaCommunicationInterface,
+        address: u32,
+    ) -> Result<(), XtensaError> {
+        self.current_address = address;
+
+        Ok(())
+    }
+
+    fn read_one(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<DeferredResultIndex, XtensaError> {
+        interface.schedule_write_cpu_register(CpuRegister::A3, self.current_address)?;
+        self.current_address += 4;
+
+        interface
+            .xdm
+            .schedule_execute_instruction(Instruction::L32I(CpuRegister::A3, CpuRegister::A4, 0));
+
+        Ok(interface.schedule_read_cpu_register(CpuRegister::A4))
+    }
+
+    fn read_one_and_continue(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+    ) -> Result<DeferredResultIndex, XtensaError> {
+        self.read_one(interface)
+    }
+
+    fn write_one(
+        &mut self,
+        interface: &mut XtensaCommunicationInterface,
+        data: u32,
+    ) -> Result<(), XtensaError> {
+        // Store address and data
+        interface.schedule_write_cpu_register(CpuRegister::A3, self.current_address)?;
+        interface.schedule_write_cpu_register(CpuRegister::A4, data)?;
+
+        // Increment address
+        self.current_address += 4;
+
+        // Store A4 into address A3
+        interface
+            .xdm
+            .schedule_execute_instruction(Instruction::S32I(CpuRegister::A3, CpuRegister::A4, 0));
+
+        Ok(())
+    }
+}

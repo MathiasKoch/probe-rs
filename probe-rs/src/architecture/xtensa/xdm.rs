@@ -1,11 +1,13 @@
-use std::fmt::Debug;
+use std::{
+    fmt::Debug,
+    time::{Duration, Instant},
+};
 
 use crate::{
     architecture::xtensa::arch::instruction::{Instruction, InstructionEncoding},
-    probe::DebugProbeError,
     probe::{
         CommandResult, DeferredResultIndex, DeferredResultSet, JTAGAccess, JtagCommandQueue,
-        JtagWriteCommand,
+        JtagWriteCommand, ShiftDrCommand,
     },
     Error as ProbeRsError,
 };
@@ -85,81 +87,101 @@ impl From<PowerDevice> for TapInstruction {
     }
 }
 
-#[derive(thiserror::Error, Debug, Copy, Clone)]
+#[derive(thiserror::Error, Debug, Copy, Clone, docsplay::Display)]
 pub enum DebugRegisterError {
-    #[error("Register is busy")]
+    /// Register is busy
     Busy,
 
-    #[error("Register-specific error")]
+    /// Register-specific error
     Error,
 
-    #[error("Unexpected value")]
-    Unexpected,
+    /// Unexpected value {0:#04x}
+    Unexpected(u8),
 }
 
-#[derive(thiserror::Error, Debug, Clone, Copy)]
+#[derive(thiserror::Error, Debug, Clone, Copy, docsplay::Display)]
 pub enum Error {
-    #[error("Error while accessing register")]
-    Xdm(#[from] DebugRegisterError),
+    /// Error {access} register {narsel:#04X}
+    Xdm {
+        /// Nexus Address Register selector. Contains the ID of the register being accessed.
+        narsel: u8,
 
-    #[error("ExecExeception")]
+        /// Access type (reading or writing)
+        access: &'static str,
+
+        /// The error that occurred.
+        source: DebugRegisterError,
+    },
+
+    /// The instruction execution has encountered an exception.
     ExecExeception,
 
-    #[error("ExecBusy")]
+    /// The core is still executing a previous instruction.
     ExecBusy,
 
-    #[error("ExecOverrun")]
+    /// Instruction execution overrun.
     ExecOverrun,
 
-    #[error("Instruction ignored")]
+    /// The instruction was ignored. Most often this indicates that the core was not halted before
+    /// requesting instruction execution.
     InstructionIgnored,
 
-    #[error("XdmPoweredOff")]
+    /// The Xtensa Debug Module is powered off.
     XdmPoweredOff,
 }
 
-#[derive(Debug)]
-pub struct Xdm {
-    pub probe: Box<dyn JTAGAccess>,
-
-    device_id: u32,
-
+#[derive(Debug, Default)]
+pub struct XdmState {
+    /// The last instruction to be executed.
+    // This is used to:
+    // - detect incorrect uses of `schedule_write_ddr_and_execute` which expects an instruction to
+    //   be loaded
+    // - wait for the last instruction to complete before proceeding, as some instructions can be
+    //   assumed to complete instantly.
     last_instruction: Option<Instruction>,
 
-    halt_on_reset: bool,
-
+    /// The command queue for the current batch. JTAG accesses are batched to reduce the number of
+    /// IO operations.
     queue: JtagCommandQueue,
+
+    /// The results of the reads in the already executed batched JTAG commands.
     jtag_results: DeferredResultSet,
 
+    /// Read handles for accesses that need to force capturing their bits.
+    ///
+    /// The batching system tries to minimize the number of captured bits, in order to reduce
+    /// the number of JTAG operations. However, some accesses need to capture their bits to
+    /// complete correctly, or to - ironically - increase performance. We store their otherwise
+    /// ignored handles in this vector and drop them when we're done with the batch.
     status_idxs: Vec<DeferredResultIndex>,
 }
 
-impl Xdm {
-    pub fn new(probe: Box<dyn JTAGAccess>) -> Result<Self, (Box<dyn JTAGAccess>, XtensaError)> {
+/// The lower level functions of the Xtensa Debug Module.
+// TODO: this is mostly JTAG-specific, but not specifically. We should probably split this up, e.g.
+// move the instruction execution into the current communication_interface module.
+#[derive(Debug)]
+pub struct Xdm<'probe> {
+    /// The JTAG interface.
+    pub probe: &'probe mut dyn JTAGAccess,
+
+    /// Debug module state.
+    state: &'probe mut XdmState,
+}
+
+impl<'probe> Xdm<'probe> {
+    pub fn new(probe: &'probe mut dyn JTAGAccess, state: &'probe mut XdmState) -> Self {
         // TODO implement openocd's esp32_queue_tdi_idle() to prevent potentially damaging flash ICs
 
-        let mut x = Self {
-            probe,
-            device_id: 0,
-            last_instruction: None,
-
-            halt_on_reset: false,
-
-            queue: JtagCommandQueue::new(),
-            jtag_results: DeferredResultSet::new(),
-
-            status_idxs: Vec::new(),
-        };
-
-        if let Err(e) = x.init() {
-            return Err((x.free(), e));
-        }
-
-        Ok(x)
+        Self { probe, state }
     }
 
     #[tracing::instrument(skip(self))]
-    fn init(&mut self) -> Result<(), XtensaError> {
+    pub(crate) fn enter_debug_mode(&mut self) -> Result<(), XtensaError> {
+        self.state.queue = JtagCommandQueue::new();
+        self.state.jtag_results = DeferredResultSet::new();
+
+        self.probe.tap_reset()?;
+
         let mut pwr_control = PowerControl(0);
 
         pwr_control.set_debug_wakeup(true);
@@ -170,15 +192,16 @@ impl Xdm {
         self.pwr_write(PowerDevice::PowerControl, pwr_control.0)?;
 
         tracing::trace!("Waiting for power domain to turn on");
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         loop {
             let bits = self.pwr_write(PowerDevice::PowerStat, 0)?;
+            tracing::debug!("PowerStatus: {:?}", PowerStatus(bits));
             if PowerStatus(bits).debug_domain_on() {
                 break;
             }
 
-            if now.elapsed().as_millis() > 500 {
-                return Err(XtensaError::Timeout);
+            if now.elapsed() > Duration::from_millis(500) {
+                return Err(XtensaError::CoreDisabled);
             }
         }
 
@@ -187,20 +210,19 @@ impl Xdm {
         pwr_control.set_jtag_debug_use(true);
         self.pwr_write(PowerDevice::PowerControl, pwr_control.0)?;
 
+        let idcode = self.read_idcode()?;
+        tracing::debug!("Read IDCODE: {:#010X}", idcode);
+
+        self.check_enabled()?;
+
         // enable the debug module
-        self.write_nexus_register(DebugControlSet({
+        self.debug_control({
             let mut reg = DebugControlBits(0);
             reg.set_enable_ocd(true);
+            reg.set_break_in_en(true);
+            reg.set_break_out_en(true);
             reg
-        }))?;
-
-        // read the device_id
-        let device_id = self.read_nexus_register::<OcdId>()?.0;
-
-        if device_id == 0 || device_id == !0 {
-            return Err(DebugProbeError::TargetNotFound.into());
-        }
-        tracing::info!("Found Xtensa device with OCDID: 0x{:08X}", device_id);
+        })?;
 
         let status = self.status()?;
         tracing::debug!("{:?}", status);
@@ -215,55 +237,115 @@ impl Xdm {
             status.set_exec_overrun(true);
             status.set_debug_pend_break(true);
             status.set_debug_pend_host(true);
+            status.set_debug_int_break(true);
 
             status
         })?;
 
-        // TODO check status and clear bits if required
-        self.device_id = device_id;
-
         Ok(())
     }
 
-    pub fn clear_exec_exception(&mut self) -> Result<(), XtensaError> {
-        self.write_nexus_register({
+    pub(crate) fn debug_control(&mut self, bits: DebugControlBits) -> Result<(), XtensaError> {
+        self.schedule_write_nexus_register(DebugControlSet(bits));
+        self.schedule_write_nexus_register(DebugControlClear({
+            let mut reg = DebugControlBits(0);
+
+            reg.set_break_in_en(!bits.break_in_en());
+            reg.set_break_out_en(!bits.break_out_en());
+            reg.set_debug_sw_active(!bits.debug_sw_active());
+            reg.set_run_stall_in_en(!bits.run_stall_in_en());
+            reg.set_debug_mode_out_en(!bits.debug_mode_out_en());
+
+            reg
+        }));
+        // Clear pending interrupts that would re-enter us into the Stopped state.
+        self.schedule_write_nexus_register({
             let mut status = DebugStatus(0);
 
-            status.set_exec_exception(true);
+            status.set_debug_pend_break(true);
+            status.set_debug_int_break(true);
 
             status
-        })?;
+        });
 
         Ok(())
     }
 
-    pub(super) fn execute(&mut self) -> Result<(), XtensaError> {
-        let mut queue = std::mem::take(&mut self.queue);
+    fn check_enabled(&mut self) -> Result<(), XtensaError> {
+        let Ok(device_id) = self.read_nexus_register::<OcdId>() else {
+            return Err(XtensaError::CoreDisabled);
+        };
+        let device_id = device_id.0;
+        tracing::debug!("Read OCDID: {:#010X}", device_id);
+
+        if device_id == 0 || device_id == u32::MAX {
+            // Disable the debug module if we can't work with it.
+            self.pwr_write(PowerDevice::PowerControl, 0)?;
+            return Err(XtensaError::CoreDisabled);
+        }
+        tracing::info!("Found Xtensa device with OCDID: {:#010X}", device_id);
+        Ok(())
+    }
+
+    fn power_status(&mut self, clear: PowerStatus) -> Result<PowerStatus, XtensaError> {
+        let bits = self.pwr_write(PowerDevice::PowerStat, clear.0)?;
+        Ok(PowerStatus(bits))
+    }
+
+    /// Read and clear the `core_was_reset` flag.
+    pub(crate) fn core_was_reset(&mut self) -> Result<bool, XtensaError> {
+        self.power_status({
+            let mut clear_value = PowerStatus(0);
+            clear_value.set_core_was_reset(true);
+            clear_value
+        })
+        .map(|bits| bits.core_was_reset())
+    }
+
+    /// Read and clear the `debug_was_reset` flag.
+    pub(crate) fn debug_was_reset(&mut self) -> Result<bool, XtensaError> {
+        self.power_status({
+            let mut clear_value = PowerStatus(0);
+            clear_value.set_debug_was_reset(true);
+            clear_value
+        })
+        .map(|bits| bits.debug_was_reset())
+    }
+
+    /// Read and clear the `core_was_reset` flag.
+    pub(crate) fn read_power_status(&mut self) -> Result<PowerStatus, XtensaError> {
+        let bits = self.pwr_write(PowerDevice::PowerStat, 0)?;
+        Ok(PowerStatus(bits))
+    }
+
+    pub(crate) fn execute(&mut self) -> Result<(), XtensaError> {
+        let mut queue = std::mem::take(&mut self.state.queue);
+
+        tracing::debug!("Executing {} commands", queue.len());
 
         // Drop the status readers when we're done.
         // We take now to avoid a possibly recursive call to clear before it's time.
-        let _idxs = std::mem::take(&mut self.status_idxs);
+        let _idxs = std::mem::take(&mut self.state.status_idxs);
 
         while !queue.is_empty() {
             match self.probe.write_register_batch(&queue) {
                 Ok(result) => {
-                    self.jtag_results.merge_from(result);
+                    self.state.jtag_results.merge_from(result);
                     return Ok(());
                 }
                 Err(e) => {
+                    let mut to_consume = e.results.len();
                     match e.error {
-                        ProbeRsError::Xtensa(XtensaError::XdmError(Error::Xdm(
-                            DebugRegisterError::Busy,
-                        ))) => {
+                        ProbeRsError::Xtensa(XtensaError::XdmError(Error::Xdm {
+                            source: DebugRegisterError::Busy,
+                            ..
+                        })) => {
                             // The specific nexus register may need some longer delay. For now we just
                             // retry, but we should probably add some no-ops later.
                         }
                         ProbeRsError::Xtensa(XtensaError::XdmError(Error::ExecBusy)) => {
-                            // The instruction is still executing. We don't do anything except clear the
-                            // error and retry.
-                            // While this is recursive, this register read-write does not involve
-                            // instructions so we can't end up with an unbounded recursion here.
-                            self.clear_exec_exception()?;
+                            // The instruction is still executing. Retry the Debug Status read.
+                            to_consume -= 1;
                         }
                         ProbeRsError::Probe(error) => return Err(error.into()),
                         ProbeRsError::Xtensa(error) => return Err(error),
@@ -271,8 +353,8 @@ impl Xdm {
                     }
 
                     // queue up the remaining commands when we retry
-                    queue.consume(e.results.len());
-                    self.jtag_results.merge_from(e.results);
+                    queue.consume(to_consume);
+                    self.state.jtag_results.merge_from(e.results);
                 }
             }
         }
@@ -284,12 +366,13 @@ impl Xdm {
         &mut self,
         index: DeferredResultIndex,
     ) -> Result<CommandResult, XtensaError> {
-        match self.jtag_results.take(index) {
+        match self.state.jtag_results.take(index) {
             Ok(result) => Ok(result),
             Err(index) => {
                 self.execute()?;
                 // We can lose data if `execute` fails.
-                self.jtag_results
+                self.state
+                    .jtag_results
                     .take(index)
                     .map_err(|_| XtensaError::BatchedResultNotAvailable)
             }
@@ -297,31 +380,33 @@ impl Xdm {
     }
 
     fn do_nexus_op(&mut self, nar: u8, ndr: u32, transform: TransformFn) -> DeferredResultIndex {
-        let nar = self.queue.schedule(JtagWriteCommand {
+        let nar = self.state.queue.schedule(JtagWriteCommand {
             address: TapInstruction::Nar.code(),
             data: nar.to_le_bytes().to_vec(),
             len: TapInstruction::Nar.bits(),
-            transform: |capture| {
-                let nar = TapInstruction::Nar.capture_to_u8(&capture);
-                let error = match nar & 0b00000011 {
-                    0 => return Ok(CommandResult::None),
-                    1 => DebugRegisterError::Error,
-                    2 => DebugRegisterError::Busy,
-                    _ => DebugRegisterError::Unexpected,
-                };
+            transform: |write, capture| {
+                let capture = TapInstruction::Nar.capture_to_u8(&capture);
+                let nar = write.data[0] >> 1;
+                let write = write.data[0] & 1 == 1;
 
                 // eww...?
-                Err(ProbeRsError::Xtensa(XtensaError::XdmError(Error::Xdm(
-                    error,
-                ))))
+                Err(ProbeRsError::Xtensa(XtensaError::XdmError(Error::Xdm {
+                    narsel: nar,
+                    access: if write { "writing" } else { "reading" },
+                    source: match capture & 0b00000011 {
+                        0 => return Ok(CommandResult::None),
+                        1 => DebugRegisterError::Error,
+                        2 => DebugRegisterError::Busy,
+                        _ => DebugRegisterError::Unexpected(capture),
+                    },
+                })))
             },
         });
 
         // We save the nar reader because we want to capture the previous status.
-        self.status_idxs.push(nar);
+        self.state.status_idxs.push(nar);
 
-        self.queue.schedule(JtagWriteCommand {
-            address: TapInstruction::Ndr.code(),
+        self.state.queue.schedule(ShiftDrCommand {
             data: ndr.to_le_bytes().to_vec(),
             len: TapInstruction::Ndr.bits(),
             transform,
@@ -379,7 +464,7 @@ impl Xdm {
         Ok(res)
     }
 
-    fn schedule_read_nexus_register<R: NexusRegister>(&mut self) -> DeferredResultIndex {
+    pub(super) fn schedule_read_nexus_register<R: NexusRegister>(&mut self) -> DeferredResultIndex {
         tracing::debug!("Reading from {}", R::NAME);
         self.schedule_dbg_read(R::ADDRESS)
     }
@@ -393,17 +478,20 @@ impl Xdm {
         Ok(reg)
     }
 
-    fn schedule_write_nexus_register<R: NexusRegister>(&mut self, register: R) {
+    pub(crate) fn schedule_write_nexus_register<R: NexusRegister>(&mut self, register: R) {
         tracing::debug!("Writing {}: {:08x}", R::NAME, register.bits());
         self.schedule_dbg_write(R::ADDRESS, register.bits());
     }
 
-    fn write_nexus_register<R: NexusRegister>(&mut self, register: R) -> Result<(), XtensaError> {
+    pub(crate) fn write_nexus_register<R: NexusRegister>(
+        &mut self,
+        register: R,
+    ) -> Result<(), XtensaError> {
         self.schedule_write_nexus_register(register);
         self.execute()
     }
 
-    fn status(&mut self) -> Result<DebugStatus, XtensaError> {
+    pub(super) fn status(&mut self) -> Result<DebugStatus, XtensaError> {
         self.read_nexus_register::<DebugStatus>()
     }
 
@@ -411,7 +499,7 @@ impl Xdm {
         let status_reader = self
             .schedule_dbg_read_and_transform(DebugStatus::ADDRESS, transform_instruction_status);
 
-        self.status_idxs.push(status_reader);
+        self.state.status_idxs.push(status_reader);
     }
 
     /// Instructs Core to enter Core Stopped state instead of vectoring on a Debug Exception/Interrupt.
@@ -427,6 +515,8 @@ impl Xdm {
 
             control.set_enable_ocd(true);
             control.set_debug_interrupt(true);
+            control.set_break_in_en(true);
+            control.set_break_out_en(true);
 
             control
         }));
@@ -440,11 +530,6 @@ impl Xdm {
 
             status
         });
-    }
-
-    pub(super) fn is_in_ocd_mode(&mut self) -> Result<bool, XtensaError> {
-        let reg = self.read_nexus_register::<DebugControlSet>()?;
-        Ok(reg.0.enable_ocd())
     }
 
     pub(super) fn leave_ocd_mode(&mut self) -> Result<(), XtensaError> {
@@ -474,15 +559,13 @@ impl Xdm {
             let mut control = DebugControlBits(0);
 
             control.set_enable_ocd(true);
+            control.set_break_in_en(true);
+            control.set_break_out_en(true);
 
             control
         }))?;
 
         Ok(())
-    }
-
-    pub(super) fn is_halted(&mut self) -> Result<bool, XtensaError> {
-        self.status().map(|status| status.stopped())
     }
 
     pub(super) fn resume(&mut self) -> Result<(), XtensaError> {
@@ -503,7 +586,7 @@ impl Xdm {
 
     pub(super) fn schedule_write_instruction(&mut self, instruction: Instruction) {
         tracing::debug!("Preparing instruction: {:?}", instruction);
-        self.last_instruction = Some(instruction);
+        self.state.last_instruction = Some(instruction);
 
         match instruction.encode() {
             InstructionEncoding::Narrow(inst) => {
@@ -514,7 +597,7 @@ impl Xdm {
 
     pub(super) fn schedule_execute_instruction(&mut self, instruction: Instruction) {
         tracing::debug!("Executing instruction: {:?}", instruction);
-        self.last_instruction = Some(instruction);
+        self.state.last_instruction = Some(instruction);
 
         match instruction.encode() {
             InstructionEncoding::Narrow(inst) => {
@@ -541,7 +624,7 @@ impl Xdm {
     }
 
     pub(super) fn schedule_write_ddr_and_execute(&mut self, ddr: u32) {
-        if let Some(instruction) = self.last_instruction {
+        if let Some(instruction) = self.state.last_instruction {
             tracing::debug!("Executing instruction via DDREXEC write: {:?}", instruction);
         } else {
             tracing::warn!("Writing DDREXEC without instruction");
@@ -554,20 +637,23 @@ impl Xdm {
     fn schedule_wait_for_last_instruction(&mut self) {
         // Assume some instructions complete practically instantly and don't waste bandwidth
         // checking their results.
-        if !matches!(
-            self.last_instruction,
-            Some(
-                Instruction::Lddr32P(_)
-                    | Instruction::Sddr32P(_)
-                    | Instruction::Rsr(_, _)
+        if let Some(last_instruction) = self.state.last_instruction {
+            let wait = !matches!(
+                last_instruction,
+                Instruction::Rsr(_, _)
                     | Instruction::Wsr(_, _)
-            )
-        ) {
-            self.schedule_wait_for_exec_done();
+                    | Instruction::Lddr32P(_)
+                    | Instruction::Sddr32P(_)
+            );
+
+            if wait {
+                self.schedule_wait_for_exec_done();
+            }
         }
     }
 
-    pub fn target_reset_assert(&mut self) -> Result<(), XtensaError> {
+    pub fn reset_and_halt(&mut self) -> Result<(), XtensaError> {
+        self.execute()?;
         self.pwr_write(PowerDevice::PowerControl, {
             let mut pwr_control = PowerControl(0);
 
@@ -579,14 +665,7 @@ impl Xdm {
 
             pwr_control.0
         })?;
-
-        Ok(())
-    }
-
-    pub fn target_reset_deassert(&mut self) -> Result<(), XtensaError> {
-        if self.halt_on_reset {
-            self.halt()?;
-        }
+        self.halt()?;
 
         self.pwr_write(PowerDevice::PowerControl, {
             let mut pwr_control = PowerControl(0);
@@ -601,29 +680,30 @@ impl Xdm {
 
         Ok(())
     }
-
-    pub(crate) fn halt_on_reset(&mut self, en: bool) {
-        self.halt_on_reset = en;
-    }
-
-    pub(super) fn free(self) -> Box<dyn JTAGAccess> {
-        self.probe
-    }
 }
 
-type TransformFn = fn(Vec<u8>) -> Result<CommandResult, ProbeRsError>;
+type TransformFn = fn(&ShiftDrCommand, Vec<u8>) -> Result<CommandResult, ProbeRsError>;
 
-fn transform_u32(capture: Vec<u8>) -> Result<CommandResult, ProbeRsError> {
+fn transform_u32(
+    _command: &ShiftDrCommand,
+    capture: Vec<u8>,
+) -> Result<CommandResult, ProbeRsError> {
     Ok(CommandResult::U32(
         TapInstruction::Ndr.capture_to_u32(&capture),
     ))
 }
 
-fn transform_noop(_capture: Vec<u8>) -> Result<CommandResult, ProbeRsError> {
+fn transform_noop(
+    _command: &ShiftDrCommand,
+    _capture: Vec<u8>,
+) -> Result<CommandResult, ProbeRsError> {
     Ok(CommandResult::None)
 }
 
-fn transform_instruction_status(capture: Vec<u8>) -> Result<CommandResult, ProbeRsError> {
+fn transform_instruction_status(
+    _command: &ShiftDrCommand,
+    capture: Vec<u8>,
+) -> Result<CommandResult, ProbeRsError> {
     let status = DebugStatus(TapInstruction::Ndr.capture_to_u32(&capture));
 
     if status.exec_overrun() {
@@ -636,21 +716,16 @@ fn transform_instruction_status(capture: Vec<u8>) -> Result<CommandResult, Probe
             Error::ExecExeception,
         )));
     }
-    if !status.exec_busy() && !status.exec_done() {
-        return Err(ProbeRsError::Xtensa(XtensaError::XdmError(
-            Error::InstructionIgnored,
-        )));
+    if status.exec_busy() {
+        return Err(ProbeRsError::Xtensa(XtensaError::XdmError(Error::ExecBusy)));
+    }
+    if status.exec_done() {
+        return Ok(CommandResult::None);
     }
 
-    Ok(CommandResult::None)
-}
-
-// TODO: I don't think these should be transformed into XtensaError directly. We might want to
-// attach register-specific messages via an in-between type.
-impl From<DebugRegisterError> for XtensaError {
-    fn from(e: DebugRegisterError) -> Self {
-        XtensaError::XdmError(e.into())
-    }
+    Err(ProbeRsError::Xtensa(XtensaError::XdmError(
+        Error::InstructionIgnored,
+    )))
 }
 
 bitfield::bitfield! {
@@ -668,6 +743,7 @@ bitfield::bitfield! {
 bitfield::bitfield! {
     #[derive(Copy, Clone)]
     pub struct PowerStatus(u8);
+    impl Debug;
 
     pub core_domain_on,    _: 0;
     pub mem_domain_on,     _: 1;
@@ -721,7 +797,7 @@ bitfield::bitfield! {
 }
 
 /// An abstraction over all registers that can be accessed via the NAR/NDR instruction pair.
-trait NexusRegister: Sized + Copy + Debug {
+pub(crate) trait NexusRegister: Sized + Copy + Debug {
     /// NAR register address
     const ADDRESS: u8;
     const NAME: &'static str;
@@ -783,7 +859,7 @@ bitfield::bitfield! {
 
 #[derive(Copy, Clone, Debug)]
 /// Bits written as 1 are set to 1 in hardware.
-struct DebugControlSet(DebugControlBits);
+pub struct DebugControlSet(pub(crate) DebugControlBits);
 
 impl NexusRegister for DebugControlSet {
     const ADDRESS: u8 = NARADR_DCRSET;
@@ -800,7 +876,7 @@ impl NexusRegister for DebugControlSet {
 
 #[derive(Copy, Clone, Debug)]
 /// Bits written as 1 are set to 0 in hardware.
-struct DebugControlClear(DebugControlBits);
+pub struct DebugControlClear(pub(crate) DebugControlBits);
 
 impl NexusRegister for DebugControlClear {
     const ADDRESS: u8 = NARADR_DCRCLR;

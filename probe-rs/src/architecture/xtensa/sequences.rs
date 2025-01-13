@@ -1,6 +1,7 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use crate::architecture::xtensa::communication_interface::XtensaCommunicationInterface;
+use crate::Session;
 
 /// A interface to operate debug sequences for Xtensa targets.
 ///
@@ -15,11 +16,19 @@ pub trait XtensaDebugSequence: Send + Sync + Debug {
     }
 
     /// Detects the flash size of the target.
-    fn detect_flash_size(
-        &self,
-        _interface: &mut XtensaCommunicationInterface,
-    ) -> Result<Option<usize>, crate::Error> {
+    fn detect_flash_size(&self, _session: &mut Session) -> Result<Option<usize>, crate::Error> {
         Ok(None)
+    }
+
+    /// Executes a system-wide reset without debug domain (or warm-reset that preserves debug connection) via software mechanisms.
+    fn reset_system_and_halt(
+        &self,
+        interface: &mut XtensaCommunicationInterface,
+        timeout: Duration,
+    ) -> Result<(), crate::Error> {
+        interface.reset_and_halt(timeout)?;
+
+        Ok(())
     }
 }
 

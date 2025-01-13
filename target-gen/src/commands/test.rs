@@ -6,24 +6,24 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
-use probe_rs::flashing::erase_all;
-use probe_rs::MemoryInterface;
 use probe_rs::{
-    flashing::{erase_sectors, DownloadOptions, FlashLoader, FlashProgress},
-    Permissions, Session,
+    flashing::{
+        erase_all, erase_sectors, DownloadOptions, FlashLoader, FlashProgress, ProgressEvent,
+    },
+    MemoryInterface, Permissions, Session,
 };
 use probe_rs_target::RawFlashAlgorithm;
 use xshell::{cmd, Shell};
 
 use crate::commands::elf::cmd_elf;
 
-const ALGORITHM_NAME: &str = "algorithm-test";
-
 pub fn cmd_test(
     target_artifact: &Path,
     template_path: &Path,
     definition_export_path: &Path,
     test_start_sector_address: Option<u64>,
+    chip: Option<String>,
+    name: Option<String>,
 ) -> Result<()> {
     ensure_is_file(target_artifact)?;
     ensure_is_file(template_path)?;
@@ -49,7 +49,7 @@ pub fn cmd_test(
         true,
         Some(definition_export_path),
         true,
-        Some(String::from(ALGORITHM_NAME)),
+        name,
     )?;
 
     if let Err(error) = generate_debug_info(target_artifact) {
@@ -57,46 +57,66 @@ pub fn cmd_test(
         println!("{error}");
     }
 
+    // Add the target to the registry from the generated YAML file
     let file = File::open(Path::new(definition_export_path))?;
-    probe_rs::config::add_target_from_yaml(file)?;
+    let family_name = probe_rs::config::add_target_from_yaml(file)?;
+
+    let targets = probe_rs::config::get_targets_by_family_name(&family_name)
+        .with_context(|| format!("Failed to get targets of {family_name}"))?;
+
+    let target_name = match targets.len() {
+        0 => return Err(anyhow!("No targets found for family {family_name}")),
+        1 => &targets[0],
+        count if chip.is_none() => {
+            return Err(anyhow!(
+                "{count} targets found for family {family_name}: {targets:#?}. Specify the desired target with --chip."
+            ));
+        }
+        _ => {
+            let chip = chip.as_ref().unwrap();
+            targets
+                .iter()
+                .find(|target| *target == chip)
+                .with_context(|| format!("No target found for chip {chip}"))?
+        }
+    };
+
+    // We need to get the chip name so that special startup procedure can be used. (matched on name)
     let mut session =
-        probe_rs::Session::auto_attach(ALGORITHM_NAME, Permissions::new().allow_erase_all())?;
+        probe_rs::Session::auto_attach(target_name, Permissions::new().allow_erase_all())?;
 
     // Register callback to update the progress.
     let t = Rc::new(RefCell::new(Instant::now()));
-    let progress = FlashProgress::new(move |event| {
-        use probe_rs::flashing::ProgressEvent;
-        match event {
-            ProgressEvent::StartedProgramming { .. } => {
-                let mut t = t.borrow_mut();
-                *t = Instant::now();
-            }
-            ProgressEvent::StartedErasing => {
-                let mut t = t.borrow_mut();
-                *t = Instant::now();
-            }
-            ProgressEvent::FailedErasing => {
-                println!("Failed erasing in {:?}", t.borrow().elapsed());
-            }
-            ProgressEvent::FinishedErasing => {
-                println!("Finished erasing in {:?}", t.borrow().elapsed());
-            }
-            ProgressEvent::FailedProgramming => {
-                println!("Failed programming in {:?}", t.borrow().elapsed());
-            }
-            ProgressEvent::FinishedProgramming => {
-                println!("Finished programming in {:?}", t.borrow().elapsed());
-            }
-            ProgressEvent::DiagnosticMessage { message } => {
-                let prefix = "Message".yellow();
-                if message.ends_with('\n') {
-                    print!("{prefix}: {message}");
-                } else {
-                    println!("{prefix}: {message}");
-                }
-            }
-            _ => (),
+    let progress = FlashProgress::new(move |event| match event {
+        ProgressEvent::StartedProgramming { .. } => {
+            let mut t = t.borrow_mut();
+            *t = Instant::now();
         }
+        ProgressEvent::StartedErasing => {
+            let mut t = t.borrow_mut();
+            *t = Instant::now();
+        }
+        ProgressEvent::FailedErasing => {
+            println!("Failed erasing in {:?}", t.borrow().elapsed());
+        }
+        ProgressEvent::FinishedErasing => {
+            println!("Finished erasing in {:?}", t.borrow().elapsed());
+        }
+        ProgressEvent::FailedProgramming => {
+            println!("Failed programming in {:?}", t.borrow().elapsed());
+        }
+        ProgressEvent::FinishedProgramming => {
+            println!("Finished programming in {:?}", t.borrow().elapsed());
+        }
+        ProgressEvent::DiagnosticMessage { message } => {
+            let prefix = "Message".yellow();
+            if message.ends_with('\n') {
+                print!("{prefix}: {message}");
+            } else {
+                println!("{prefix}: {message}");
+            }
+        }
+        _ => (),
     });
 
     let flash_algorithm = if let Some(test_start_sector_address) = test_start_sector_address {
@@ -114,7 +134,7 @@ pub fn cmd_test(
     } else {
         &session.target().flash_algorithms[0]
     };
-    let flash_properties = flash_algorithm.flash_properties.clone();
+    let flash_properties = &flash_algorithm.flash_properties;
     let start_address = flash_properties.address_range.start;
     let end_address = flash_properties.address_range.end;
     let data_size = flash_properties.page_size;
@@ -138,21 +158,29 @@ pub fn cmd_test(
     run_flash_erase(
         &mut session,
         progress.clone(),
-        EraseSectors(test_start_sector_index, 2),
+        EraseType::EraseSectors(test_start_sector_index, 2),
     )?;
+
+    println!("{test}: Erase done");
+
     let mut readback = vec![0; (sector_size * 2) as usize];
     session
         .core(0)?
         .read_8(test_start_sector_address, &mut readback)?;
     assert!(
-        !readback.iter().any(|v| *v != erased_state),
+        readback.iter().all(|v| *v == erased_state),
         "Not all sectors were erased"
     );
+
+    println!("{test}: Writing two pages ...");
 
     let mut loader = session.target().flash_loader();
     let data = (0..data_size).map(|n| (n % 256) as u8).collect::<Vec<_>>();
     loader.add_data(test_start_sector_address + 1, &data)?;
     run_flash_download(&mut session, loader, progress.clone(), true)?;
+
+    println!("{test}: Write done");
+
     let mut readback = vec![0; data_size as usize];
     session
         .core(0)?
@@ -160,20 +188,25 @@ pub fn cmd_test(
     assert_eq!(readback, data);
 
     println!("{test}: Erasing the entire chip and writing two pages ...");
-    run_flash_erase(&mut session, progress.clone(), EraseAll)?;
+    run_flash_erase(&mut session, progress.clone(), EraseType::EraseAll)?;
+    println!("{test}: Erase done");
     let mut readback = vec![0; (sector_size * 2) as usize];
     session
         .core(0)?
         .read_8(test_start_sector_address, &mut readback)?;
     assert!(
-        !readback.iter().any(|v| *v != erased_state),
+        readback.iter().all(|v| *v == erased_state),
         "Not all sectors were erased"
     );
 
+    println!("{test}: Writing two pages ...");
     let mut loader = session.target().flash_loader();
     let data = (0..data_size).map(|n| (n % 256) as u8).collect::<Vec<_>>();
     loader.add_data(test_start_sector_address + 1, &data)?;
     run_flash_download(&mut session, loader, progress.clone(), true)?;
+
+    println!("{test}: Write done");
+
     let mut readback = vec![0; data_size as usize];
     session
         .core(0)?
@@ -184,21 +217,26 @@ pub fn cmd_test(
     run_flash_erase(
         &mut session,
         progress.clone(),
-        EraseSectors(test_start_sector_index, 2),
+        EraseType::EraseSectors(test_start_sector_index, 2),
     )?;
+    println!("{test}: Erase done");
+
     let mut readback = vec![0; (sector_size * 2) as usize];
     session
         .core(0)?
         .read_8(test_start_sector_address, &mut readback)?;
     assert!(
-        !readback.iter().any(|v| *v != erased_state),
+        readback.iter().all(|v| *v == erased_state),
         "Not all sectors were erased"
     );
 
+    println!("{test}: Writing two pages ...");
     let mut loader = session.target().flash_loader();
     let data = (0..data_size).map(|n| (n % 256) as u8).collect::<Vec<_>>();
     loader.add_data(test_start_sector_address + 1, &data)?;
     run_flash_download(&mut session, loader, progress, false)?;
+    println!("{test}: Write done");
+
     let mut readback = vec![0; data_size as usize];
     session
         .core(0)?
@@ -242,7 +280,6 @@ pub enum EraseType {
     EraseAll,
     EraseSectors(usize, usize),
 }
-use EraseType::*;
 
 /// Erases the entire flash or just the sectors specified.
 pub fn run_flash_erase(
@@ -250,10 +287,10 @@ pub fn run_flash_erase(
     progress: FlashProgress,
     erase_type: EraseType,
 ) -> Result<()> {
-    if let EraseSectors(start_sector, sectors) = erase_type {
-        erase_sectors(session, Some(progress), start_sector, sectors)?;
+    if let EraseType::EraseSectors(start_sector, sectors) = erase_type {
+        erase_sectors(session, progress, start_sector, sectors)?;
     } else {
-        erase_all(session, Some(progress))?;
+        erase_all(session, progress)?;
     }
 
     Ok(())

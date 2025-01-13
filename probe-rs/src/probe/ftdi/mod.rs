@@ -5,8 +5,10 @@ use crate::{
             communication_interface::{DapProbe, UninitializedArmProbe},
             ArmCommunicationInterface,
         },
-        riscv::communication_interface::{RiscvCommunicationInterface, RiscvError},
-        xtensa::communication_interface::XtensaCommunicationInterface,
+        riscv::{communication_interface::RiscvInterfaceBuilder, dtm::jtag_dtm::JtagDtmBuilder},
+        xtensa::communication_interface::{
+            XtensaCommunicationInterface, XtensaDebugInterfaceState,
+        },
     },
     probe::{
         arm_debug_interface::{ProbeStatistics, RawProtocolIo, SwdSettings},
@@ -15,7 +17,6 @@ use crate::{
         ProbeCreationError, ProbeFactory, ScanChainElement, WireProtocol,
     },
 };
-use anyhow::anyhow;
 use bitvec::prelude::*;
 use nusb::DeviceInfo;
 use std::{
@@ -27,7 +28,6 @@ use std::{
 mod command_compacter;
 mod ftdaye;
 
-use crate::architecture::riscv::dtm::jtag_dtm::JtagDtm;
 use command_compacter::Command;
 use ftdaye::{error::FtdiError, ChipType};
 
@@ -74,12 +74,7 @@ impl JtagAdapter {
         let mut junk = vec![];
         let _ = self.device.read_to_end(&mut junk);
 
-        // TMS starts high
-        let output = 0x0008;
-
-        // TMS, TDO and TCK are outputs
-        let direction = 0x000b;
-
+        let (output, direction) = self.pin_layout();
         self.device.set_pins(output, direction)?;
 
         self.apply_clock_speed(self.speed_khz)?;
@@ -87,6 +82,26 @@ impl JtagAdapter {
         self.device.disable_loopback()?;
 
         Ok(())
+    }
+
+    fn pin_layout(&self) -> (u16, u16) {
+        let (output, direction) = match (
+            self.device.vendor_id(),
+            self.device.product_id(),
+            self.device.product_string().unwrap_or(""),
+        ) {
+            // Digilent HS3
+            (0x0403, 0x6014, "Digilent USB Device") => (0x2088, 0x308b),
+            // Digilent HS2
+            (0x0403, 0x6014, "Digilent Adept USB Device") => (0x00e8, 0x60eb),
+            // Digilent HS1
+            (0x0403, 0x6010, "Digilent Adept USB Device") => (0x0088, 0x008b),
+            // Other devices:
+            // TMS starts high
+            // TMS, TDO and TCK are outputs
+            _ => (0x0008, 0x000b),
+        };
+        (output, direction)
     }
 
     fn speed_khz(&self) -> u32 {
@@ -139,15 +154,6 @@ impl JtagAdapter {
 
         let mut reply = Vec::with_capacity(self.in_bit_counts.len());
         while reply.len() < self.in_bit_counts.len() {
-            if t0.elapsed() > timeout {
-                tracing::warn!(
-                    "Read {} bytes, expected {}",
-                    reply.len(),
-                    self.in_bit_counts.len()
-                );
-                return Err(DebugProbeError::Timeout);
-            }
-
             let read = self
                 .device
                 .read_to_end(&mut reply)
@@ -156,10 +162,19 @@ impl JtagAdapter {
             if read > 0 {
                 t0 = Instant::now();
             }
+
+            if t0.elapsed() > timeout {
+                tracing::warn!(
+                    "Read {} bytes, expected {}",
+                    reply.len(),
+                    self.in_bit_counts.len()
+                );
+                return Err(DebugProbeError::Timeout);
+            }
         }
 
         if reply.len() != self.in_bit_counts.len() {
-            return Err(DebugProbeError::Other(anyhow!(
+            return Err(DebugProbeError::Other(format!(
                 "Read more data than expected. Expected {} bytes, got {} bytes",
                 self.in_bit_counts.len(),
                 reply.len()
@@ -178,14 +193,13 @@ impl JtagAdapter {
     fn flush(&mut self) -> Result<(), DebugProbeError> {
         self.finalize_command()?;
         self.send_buffer()?;
-        self.read_response()
-            .map_err(|e| DebugProbeError::ProbeSpecific(Box::new(e)))?;
+        self.read_response()?;
 
         Ok(())
     }
 
     fn append_command(&mut self, command: Command) -> Result<(), DebugProbeError> {
-        tracing::debug!("Appending {:?}", command);
+        tracing::trace!("Appending {:?}", command);
         // 1 byte is reserved for the send immediate command
         if self.commands.len() + command.len() + 1 >= self.ftdi.buffer_size {
             self.send_buffer()?;
@@ -321,21 +335,25 @@ impl DebugProbe for FtdiProbe {
         Ok(())
     }
 
+    fn scan_chain(&self) -> Result<&[ScanChainElement], DebugProbeError> {
+        if let Some(ref scan_chain) = self.jtag_state.expected_scan_chain {
+            Ok(scan_chain)
+        } else {
+            Ok(&[])
+        }
+    }
+
     fn attach(&mut self) -> Result<(), DebugProbeError> {
         tracing::debug!("Attaching...");
 
-        self.adapter
-            .attach()
-            .map_err(|e| DebugProbeError::ProbeSpecific(Box::new(e)))?;
+        self.adapter.attach()?;
 
-        let chain = self.scan_chain()?;
-        tracing::info!("Found {} TAPs on reset scan", chain.len());
+        self.scan_chain()?;
+        self.select_target(0)
+    }
 
-        if chain.len() > 1 {
-            tracing::info!("More than one TAP detected, defaulting to tap0");
-        }
-
-        self.select_target(&chain, 0)
+    fn select_jtag_tap(&mut self, index: usize) -> Result<(), DebugProbeError> {
+        self.select_target(index)
     }
 
     fn detach(&mut self) -> Result<(), crate::Error> {
@@ -375,17 +393,10 @@ impl DebugProbe for FtdiProbe {
         Some(WireProtocol::Jtag)
     }
 
-    fn try_get_riscv_interface(
-        self: Box<Self>,
-    ) -> Result<RiscvCommunicationInterface, (Box<dyn DebugProbe>, RiscvError)> {
-        let jtag_dtm = match JtagDtm::new(self) {
-            Ok(jtag_dtm) => Box::new(jtag_dtm),
-            Err((access, err)) => return Err((access.into_probe(), err)),
-        };
-        match RiscvCommunicationInterface::new(jtag_dtm) {
-            Ok(interface) => Ok(interface),
-            Err((probe, err)) => Err((probe.into_probe(), err)),
-        }
+    fn try_get_riscv_interface_builder<'probe>(
+        &'probe mut self,
+    ) -> Result<Box<dyn RiscvInterfaceBuilder<'probe> + 'probe>, DebugProbeError> {
+        Ok(Box::new(JtagDtmBuilder::new(self)))
     }
 
     fn has_riscv_interface(&self) -> bool {
@@ -409,13 +420,11 @@ impl DebugProbe for FtdiProbe {
         true
     }
 
-    fn try_get_xtensa_interface(
-        self: Box<Self>,
-    ) -> Result<XtensaCommunicationInterface, (Box<dyn DebugProbe>, DebugProbeError)> {
-        match XtensaCommunicationInterface::new(self) {
-            Ok(interface) => Ok(interface),
-            Err((probe, err)) => Err((probe.into_probe(), err)),
-        }
+    fn try_get_xtensa_interface<'probe>(
+        &'probe mut self,
+        state: &'probe mut XtensaDebugInterfaceState,
+    ) -> Result<XtensaCommunicationInterface<'probe>, DebugProbeError> {
+        Ok(XtensaCommunicationInterface::new(self, state))
     }
 
     fn has_xtensa_interface(&self) -> bool {
@@ -541,7 +550,7 @@ impl TryFrom<(FtdiDevice, Option<ChipType>)> for FtdiProperties {
             },
             ChipType::FT232H => Self {
                 buffer_size: 1024,
-                max_clock: 6_000,
+                max_clock: 30_000,
                 has_divide_by_5: true,
             },
             ChipType::FT2232C => Self {

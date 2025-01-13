@@ -14,4 +14,10 @@ license.workspace = true
 [dependencies]
 jep106 = "0.2.8"
 serde = { version = "1", features = ["derive"] }
-base64 = "0.22.0"
+base64 = "0.22.1"
+url = { version = "2.5", features = ["serde"] }
+indexmap = { version = "2.2", features = ["serde"] }
+serde_with = { version = "3.8", default-features = false, features = ["indexmap_2"] }
+
+[lints]
+workspace = true

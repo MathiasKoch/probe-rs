@@ -1,12 +1,14 @@
 use crate::{
     architecture::{
         arm::{
-            ap::MemoryAp,
             core::{CortexAState, CortexMState},
-            ApAddress, ArmProbeInterface, DpAddress,
+            ArmProbeInterface, DpAddress, FullyQualifiedApAddress,
         },
-        riscv::{communication_interface::RiscvCommunicationInterface, RiscVState},
-        xtensa::{communication_interface::XtensaCommunicationInterface, XtensaState},
+        riscv::{
+            communication_interface::{RiscvCommunicationInterface, RiscvError},
+            RiscvCoreState,
+        },
+        xtensa::{communication_interface::XtensaCommunicationInterface, XtensaCoreState},
     },
     Core, CoreType, Error, Target,
 };
@@ -31,16 +33,18 @@ impl CombinedCoreState {
         self.specific_state.core_type()
     }
 
+    pub fn interface_idx(&self) -> usize {
+        self.core_state.core_access_options.interface_idx()
+    }
+
     pub(crate) fn attach_arm<'probe>(
         &'probe mut self,
         target: &'probe Target,
         arm_interface: &'probe mut Box<dyn ArmProbeInterface>,
     ) -> Result<Core<'probe>, Error> {
-        let memory_regions = &target.memory_map;
-
         let name = &target.cores[self.id].name;
 
-        let memory = arm_interface.memory_interface(self.arm_memory_ap())?;
+        let memory = arm_interface.memory_interface(&self.arm_memory_ap())?;
 
         let ResolvedCoreOptions::Arm { options, sequence } = &self.core_state.core_access_options
         else {
@@ -55,13 +59,13 @@ impl CombinedCoreState {
             SpecificCoreState::Armv6m(s) => Core::new(
                 self.id,
                 name,
-                memory_regions,
+                target,
                 crate::architecture::arm::armv6m::Armv6m::new(memory, s, debug_sequence)?,
             ),
             SpecificCoreState::Armv7a(s) => Core::new(
                 self.id,
                 name,
-                memory_regions,
+                target,
                 crate::architecture::arm::armv7a::Armv7a::new(
                     memory,
                     s,
@@ -72,13 +76,13 @@ impl CombinedCoreState {
             SpecificCoreState::Armv7m(s) | SpecificCoreState::Armv7em(s) => Core::new(
                 self.id,
                 name,
-                memory_regions,
+                target,
                 crate::architecture::arm::armv7m::Armv7m::new(memory, s, debug_sequence)?,
             ),
             SpecificCoreState::Armv8a(s) => Core::new(
                 self.id,
                 name,
-                memory_regions,
+                target,
                 crate::architecture::arm::armv8a::Armv8a::new(
                     memory,
                     s,
@@ -90,7 +94,7 @@ impl CombinedCoreState {
             SpecificCoreState::Armv8m(s) => Core::new(
                 self.id,
                 name,
-                memory_regions,
+                target,
                 crate::architecture::arm::armv8m::Armv8m::new(memory, s, debug_sequence)?,
             ),
             _ => {
@@ -118,7 +122,7 @@ impl CombinedCoreState {
             // Enable debug mode
             sequence.debug_core_start(
                 interface,
-                self.arm_memory_ap(),
+                &self.arm_memory_ap(),
                 self.core_type(),
                 options.debug_base,
                 options.cti_base,
@@ -140,7 +144,7 @@ impl CombinedCoreState {
             );
         };
 
-        let mut memory_interface = interface.memory_interface(self.arm_memory_ap())?;
+        let mut memory_interface = interface.memory_interface(&self.arm_memory_ap())?;
 
         let reset_catch_span = tracing::debug_span!("reset_catch_set", id = self.id()).entered();
         sequence.reset_catch_set(&mut *memory_interface, self.core_type(), options.debug_base)?;
@@ -153,17 +157,18 @@ impl CombinedCoreState {
     pub(crate) fn attach_riscv<'probe>(
         &'probe mut self,
         target: &'probe Target,
-        interface: &'probe mut RiscvCommunicationInterface,
+        mut interface: RiscvCommunicationInterface<'probe>,
     ) -> Result<Core<'probe>, Error> {
-        let memory_regions = &target.memory_map;
         let name = &target.cores[self.id].name;
 
-        let ResolvedCoreOptions::Riscv { options } = &self.core_state.core_access_options else {
+        let ResolvedCoreOptions::Riscv { options, sequence } = &self.core_state.core_access_options
+        else {
             unreachable!(
                 "The stored core state is not compatible with the RISC-V architecture. \
                 This should never happen. Please file a bug if it does."
             );
         };
+        let debug_sequence = sequence.clone();
 
         let SpecificCoreState::Riscv(s) = &mut self.specific_state else {
             unreachable!(
@@ -172,25 +177,36 @@ impl CombinedCoreState {
             );
         };
 
+        let hart = options.hart_id.unwrap_or_default();
+        if !interface.hart_enabled(hart) {
+            return Err(RiscvError::HartUnavailable.into());
+        }
+
+        interface.select_hart(hart)?;
+
         Ok(Core::new(
             self.id,
             name,
-            memory_regions,
-            crate::architecture::riscv::Riscv32::new(
-                options.hart_id.unwrap_or_default(),
-                interface,
-                s,
-            )?,
+            target,
+            crate::architecture::riscv::Riscv32::new(interface, s, debug_sequence)?,
         ))
     }
 
     pub(crate) fn attach_xtensa<'probe>(
         &'probe mut self,
         target: &'probe Target,
-        interface: &'probe mut XtensaCommunicationInterface,
+        interface: XtensaCommunicationInterface<'probe>,
     ) -> Result<Core<'probe>, Error> {
-        let memory_regions = &target.memory_map;
         let name = &target.cores[self.id].name;
+
+        let ResolvedCoreOptions::Xtensa { sequence, .. } = &self.core_state.core_access_options
+        else {
+            unreachable!(
+                "The stored core state is not compatible with the Xtensa architecture. \
+                This should never happen. Please file a bug if it does."
+            );
+        };
+        let debug_sequence = sequence.clone();
 
         let SpecificCoreState::Xtensa(s) = &mut self.specific_state else {
             unreachable!(
@@ -202,8 +218,8 @@ impl CombinedCoreState {
         Ok(Core::new(
             self.id,
             name,
-            memory_regions,
-            crate::architecture::xtensa::Xtensa::new(interface, s),
+            target,
+            crate::architecture::xtensa::Xtensa::new(interface, s, debug_sequence)?,
         ))
     }
 
@@ -212,7 +228,7 @@ impl CombinedCoreState {
     /// ## Panic
     ///
     /// This function will panic if the core is not an ARM core and doesn't have a memory AP
-    pub(crate) fn arm_memory_ap(&self) -> MemoryAp {
+    pub(crate) fn arm_memory_ap(&self) -> FullyQualifiedApAddress {
         self.core_state.memory_ap()
     }
 }
@@ -232,7 +248,7 @@ impl CoreState {
         }
     }
 
-    pub(crate) fn memory_ap(&self) -> MemoryAp {
+    pub(crate) fn memory_ap(&self) -> FullyQualifiedApAddress {
         let ResolvedCoreOptions::Arm { options, .. } = &self.core_access_options else {
             unreachable!(
                 "The stored core state is not compatible with the ARM architecture. \
@@ -240,14 +256,12 @@ impl CoreState {
             );
         };
 
-        let dp = match options.psel {
-            0 => DpAddress::Default,
-            x => DpAddress::Multidrop(x),
+        let dp = match options.targetsel {
+            None => DpAddress::Default,
+            Some(x) => DpAddress::Multidrop(x),
         };
 
-        let ap = ApAddress { dp, ap: options.ap };
-
-        MemoryAp::new(ap)
+        FullyQualifiedApAddress::v1_with_dp(dp, options.ap)
     }
 }
 
@@ -267,9 +281,9 @@ pub enum SpecificCoreState {
     /// The state of an ARMv8-M core.
     Armv8m(CortexMState),
     /// The state of an RISC-V core.
-    Riscv(RiscVState),
+    Riscv(RiscvCoreState),
     /// The state of an Xtensa core.
-    Xtensa(XtensaState),
+    Xtensa(XtensaCoreState),
 }
 
 impl SpecificCoreState {
@@ -281,8 +295,8 @@ impl SpecificCoreState {
             CoreType::Armv7em => SpecificCoreState::Armv7m(CortexMState::new()),
             CoreType::Armv8a => SpecificCoreState::Armv8a(CortexAState::new()),
             CoreType::Armv8m => SpecificCoreState::Armv8m(CortexMState::new()),
-            CoreType::Riscv => SpecificCoreState::Riscv(RiscVState::new()),
-            CoreType::Xtensa => SpecificCoreState::Xtensa(XtensaState::new()),
+            CoreType::Riscv => SpecificCoreState::Riscv(RiscvCoreState::new()),
+            CoreType::Xtensa => SpecificCoreState::Xtensa(XtensaCoreState::new()),
         }
     }
 

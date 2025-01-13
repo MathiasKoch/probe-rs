@@ -1,1 +1,1 @@
-Renamed `--probe-selector` to `--probe` in `cargo embed`
+probe-rs now allows selecting debug probes that have no serial number by using `VID:PID:`
